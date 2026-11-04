@@ -43,10 +43,12 @@ ARQUIVO_CFG = os.path.join(CONFIG_DIR, "config.json")
 TEMAS = {
     "claro": dict(bg="#f3f4f8", card="#ffffff", borda="#e2e5ec", texto="#1f2933",
                   suave="#6b7785", acento="#4f6df5", acento_hover="#3b57e0",
-                  acento_txt="#ffffff", chip="#e6e9f0", ok="#2e9e5b", perigo="#d64545"),
+                  acento_txt="#ffffff", chip="#e6e9f0", ok="#2e9e5b", perigo="#d64545",
+                  alerta="#fde4e4"),
     "escuro": dict(bg="#15171c", card="#20232a", borda="#2f333c", texto="#e8eaed",
                    suave="#9aa3b0", acento="#7c93ff", acento_hover="#9aabff",
-                   acento_txt="#10131a", chip="#2a2e37", ok="#4cc38a", perigo="#ff6b6b"),
+                   acento_txt="#10131a", chip="#2a2e37", ok="#4cc38a", perigo="#ff6b6b",
+                   alerta="#4d2428"),
 }
 
 # Tamanho e posição da janela principal
@@ -57,6 +59,10 @@ CANTO = "inferior-direito"    # opções: inferior-direito, inferior-esquerdo, s
 # Clipboard (Linux): True = usa xclip/wl-copy quando existirem (o texto sobrevive ao fechar o app)
 #                    False = usa só o clipboard do Tkinter (o texto some ao fechar o app)
 USAR_CLIPBOARD_EXTERNO = True
+
+# Tempo mínimo entre duas cópias (em segundos). Se clicar antes disso, o cartão
+# pisca em vermelho e balança, e nada é copiado. Use 0 para desativar.
+INTERVALO_COPIA = 1.5
 
 # Barra lateral (quando o app não está fixado e perde o foco)
 RECOLHER_AUTOMATICO = True    # False = nunca recolhe
@@ -555,6 +561,7 @@ class App(tk.Tk):
         self.f = escolher_fonte(self)
         self.largura_texto = 560
         self._toast_id = None
+        self._ultima_copia = 0.0
         self.clip_externo = ClipboardExterno() if (LINUX and USAR_CLIPBOARD_EXTERNO) else None
 
         self.arrasto_ativo = False
@@ -1162,10 +1169,67 @@ class App(tk.Tk):
         except tk.TclError:
             return False
 
+    def _tremer_cartao(self, card):
+        """Pisca o cartão em vermelho e balança de um lado para o outro (sem travar nada)."""
+        if getattr(card, "tremendo", False):
+            return
+        c = self.c
+        card.tremendo = True
+
+        def todos(w):
+            yield w
+            for filho in w.winfo_children():
+                yield from todos(filho)
+
+        borda_antes = (card.cget("highlightbackground"), card.cget("highlightcolor"))
+        widgets = list(todos(card))
+        # deslocamento à direita, em pixels (termina em 0 = posição original)
+        desloc = [8, 0, 8, 0, 6, 0, 4, 0, 2, 0]
+
+        def pintar(cor_fundo, cor_borda):
+            for w in widgets:
+                try:
+                    w.config(bg=cor_fundo)
+                except tk.TclError:
+                    pass
+            try:
+                card.config(highlightbackground=cor_borda, highlightcolor=cor_borda)
+            except tk.TclError:
+                pass
+
+        def passo(i=0):
+            try:
+                if i >= len(desloc):
+                    pintar(c["card"], borda_antes[0])
+                    if card.winfo_manager() == "pack":
+                        card.pack_configure(padx=(0, 8))
+                    card.tremendo = False
+                    return
+                l = desloc[i]
+                if card.winfo_manager() == "pack":
+                    card.pack_configure(padx=(l, 8 - l))
+                if (i // 2) % 2 == 0 and i < 8:        # pisca: vermelho, normal, vermelho...
+                    pintar(c["alerta"], c["perigo"])
+                else:
+                    pintar(c["card"], c["perigo"] if i < 8 else borda_antes[0])
+                self.after(35, passo, i + 1)
+            except tk.TclError:
+                card.tremendo = False
+
+        passo()
+
     def copiar(self, i, cat_lbl, card, original):
         c = self.c
         if i < 0:
             return
+
+        # Intervalo mínimo entre cópias: dentro dele, só avisa (não copia, não bloqueia)
+        if time.monotonic() - self._ultima_copia < INTERVALO_COPIA:
+            self._tremer_cartao(card)
+            self.mostrar_rodape("Aguarde um instante para copiar de novo", c["perigo"],
+                                volta="clique para copiar")
+            return
+
         texto = self.dados[i]["texto"]
 
         if not self._copiar_texto(texto):
@@ -1173,6 +1237,7 @@ class App(tk.Tk):
                                 volta="clique para copiar")
             return
 
+        self._ultima_copia = time.monotonic()
         cat_lbl.config(text="COPIADO", fg=c["ok"])
         card.config(highlightbackground=c["ok"], highlightcolor=c["ok"])
 
