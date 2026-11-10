@@ -16,6 +16,7 @@ Windows: só o Python oficial (já inclui o Tkinter). Nada mais a instalar.
 na mesma pasta do script.
 """
 import json
+import colorsys
 import math
 import os
 import re
@@ -60,8 +61,7 @@ CANTO = "inferior-direito"    # opções: inferior-direito, inferior-esquerdo, s
 #                    False = usa só o clipboard do Tkinter (o texto some ao fechar o app)
 USAR_CLIPBOARD_EXTERNO = True
 
-# Tempo mínimo entre duas cópias (em segundos). Se clicar antes disso, o cartão
-# pisca em vermelho e balança, e nada é copiado. Use 0 para desativar.
+# Tempo mínimo padrão entre duas cópias (em segundos). Pode ser desativado nas Configurações.
 INTERVALO_COPIA = 1.5
 
 # Barra lateral (quando o app não está fixado e perde o foco)
@@ -122,13 +122,6 @@ def escolher_fonte(root):
 
 
 # ---------- área de transferência ----------
-# O clipboard do Tkinter falha de forma silenciosa quando a cópia é rápida:
-#  - Windows: se outro programa (histórico do Windows, gerenciador de clipboard,
-#    área de trabalho remota) estiver com o clipboard aberto, o Tk não consegue
-#    abri-lo, ignora o erro e a frase anterior continua lá.
-#  - Linux: o xclip/wl-copy "vão para segundo plano" e o processo antigo podia
-#    assumir a seleção depois do novo.
-# Por isso a cópia é feita de forma direta, com tentativas e conferência.
 _WIN_API = None
 
 
@@ -369,6 +362,15 @@ def desenhar_icone(cv, tipo, ox, oy, s, cor, bg):
             for cy in (.2, .5, .8):
                 cv.create_oval(*P(cx - r, cy - r), *P(cx + r, cy + r), fill=cor, outline=cor)
 
+    elif tipo == "engrenagem":
+        cv.create_oval(*P(.28, .28), *P(.72, .72), fill=bg, outline=cor, width=w)
+        cv.create_oval(*P(.42, .42), *P(.58, .58), fill=cor, outline=cor)
+        for i in range(6):
+            a = i * math.pi / 3
+            cv.create_line(*P(.5 + .28 * math.cos(a), .5 + .28 * math.sin(a)),
+                           *P(.5 + .48 * math.cos(a), .5 + .48 * math.sin(a)),
+                           fill=cor, width=max(2, w - 1))
+
 
 class IconeBotao(tk.Canvas):
     """Botão com ícone desenhado, com efeito de hover."""
@@ -545,6 +547,577 @@ class ConfirmarDialogo(tk.Toplevel):
         self.destroy()
 
 
+# ---------------------------------------------------------------- conversões
+def rgb_para_hex(r, g, b):
+    """(0-255, 0-255, 0-255) -> '#rrggbb' (valores fora da faixa são cortados)."""
+    return "#%02x%02x%02x" % tuple(max(0, min(255, int(round(v)))) for v in (r, g, b))
+
+
+def hex_valido(texto):
+    """Normaliza '#abc', 'AABBCC' ou '#aabbcc' para '#aabbcc'. Devolve None se inválido."""
+    t = (texto or "").strip().lstrip("#")
+    if re.fullmatch(r"[0-9a-fA-F]{3}", t):
+        t = "".join(ch * 2 for ch in t)
+    if re.fullmatch(r"[0-9a-fA-F]{6}", t):
+        return "#" + t.lower()
+    return None
+
+
+def hex_para_rgb(cor):
+    cor = cor.lstrip("#")
+    return int(cor[0:2], 16), int(cor[2:4], 16), int(cor[4:6], 16)
+
+
+def hsv_para_hex(h, s, v):
+    """h, s, v em 0..1 -> '#rrggbb'."""
+    r, g, b = colorsys.hsv_to_rgb(h, s, v)
+    return rgb_para_hex(r * 255, g * 255, b * 255)
+
+
+def hex_para_hsv(cor):
+    r, g, b = hex_para_rgb(cor)
+    return colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+
+
+def misturar(cor_a, cor_b, t):
+    """Mistura duas cores hex: t=0 -> cor_a, t=1 -> cor_b."""
+    a, b = hex_para_rgb(cor_a), hex_para_rgb(cor_b)
+    return rgb_para_hex(*(x + (y - x) * t for x, y in zip(a, b)))
+
+
+def luminancia(cor):
+    """Luminância relativa (WCAG)."""
+    def lin(c):
+        c /= 255
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    r, g, b = hex_para_rgb(cor)
+    return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+
+
+def contraste(cor_a, cor_b):
+    maior, menor = sorted((luminancia(cor_a), luminancia(cor_b)), reverse=True)
+    return (maior + 0.05) / (menor + 0.05)
+
+
+def cor_do_texto_sobre(cor, claro="#ffffff", escuro="#10131a"):
+    """Escolhe texto claro ou escuro, o que tiver mais contraste sobre 'cor'."""
+    return claro if contraste(cor, claro) >= contraste(cor, escuro) else escuro
+
+
+def derivar_acento(base, tema="claro"):
+    """A partir de UMA cor, gera as 3 chaves de acento usadas pelo tema do app."""
+    alvo = "#ffffff" if tema == "escuro" else "#000000"
+    return dict(acento=base,
+                acento_hover=misturar(base, alvo, 0.18),
+                acento_txt=cor_do_texto_sobre(base))
+
+
+# ------------------------------------------------------------------- roda
+class RodaDeCores(tk.Canvas):
+    """Roda de cores clicável/arrastável.
+
+    - <Button-1>   : começa a selecionar (só se o clique for sobre a roda)
+    - <B1-Motion>  : atualiza a cor em tempo real; o seletor fica preso ao círculo
+    - comando(hex) : chamado a cada mudança de cor
+    """
+    MARGEM = 8          # folga para o marcador não ser cortado na borda
+    RAIO_MARCADOR = 7
+
+    def __init__(self, pai, tamanho=200, bg="#ffffff", cor_inicial="#4f6df5",
+                 comando=None, **kw):
+        super().__init__(pai, width=tamanho, height=tamanho, bg=bg,
+                         highlightthickness=0, bd=0, cursor="crosshair", **kw)
+        self.tamanho = tamanho
+        self.cx = self.cy = tamanho / 2
+        self.raio = tamanho / 2 - self.MARGEM
+        self.comando = comando
+        self._bg = bg                     # precisa ser '#rrggbb'
+        self._h, self._s, self._v = 0.0, 0.0, 1.0
+        self._arrastando = False
+        self._redesenho_pendente = False
+
+        self._img = tk.PhotoImage(width=tamanho, height=tamanho)
+        self._base = self._calcular_base()
+        self.create_image(0, 0, image=self._img, anchor="nw")
+
+        self._m_fora = self.create_oval(0, 0, 0, 0, outline="#000000", width=1)
+        self._m_dentro = self.create_oval(0, 0, 0, 0, outline="#ffffff", width=2)
+
+        self.bind("<Button-1>", self._clique)
+        self.bind("<B1-Motion>", self._arrasto)
+        self.bind("<ButtonRelease-1>", self._soltar)
+
+        self.set_color(cor_inicial, notificar=False)
+
+    # ---- desenho -------------------------------------------------------
+    def _calcular_base(self):
+        """Pré-calcula a roda com brilho máximo (V=1). Só roda uma vez."""
+        n, cx, cy, R = self.tamanho, self.cx, self.cy, self.raio
+        linhas = []
+        for y in range(n):
+            dy = y + 0.5 - cy
+            linha = []
+            for x in range(n):
+                dx = x + 0.5 - cx
+                d = math.hypot(dx, dy)
+                if d > R + 1:
+                    linha.append(None)
+                    continue
+                s = min(d / R, 1.0)
+                h = (math.atan2(-dy, dx) / (2 * math.pi)) % 1.0
+                r, g, b = colorsys.hsv_to_rgb(h, s, 1.0)
+                alfa = 1.0 if d <= R else 1.0 - (d - R)      # borda suave de 1 px
+                linha.append((r * 255, g * 255, b * 255, alfa))
+            linhas.append(linha)
+        return linhas
+
+    def _desenhar_roda(self):
+        v = self._v
+        br, bg_, bb = hex_para_rgb(self._bg)
+        bg_hex = self._bg
+        linhas = []
+        for linha in self._base:
+            celulas = []
+            for px in linha:
+                if px is None:
+                    celulas.append(bg_hex)
+                    continue
+                r, g, b, a = px
+                r, g, b = r * v, g * v, b * v
+                if a < 1.0:
+                    r, g, b = br + (r - br) * a, bg_ + (g - bg_) * a, bb + (b - bb) * a
+                celulas.append("#%02x%02x%02x" % (int(r), int(g), int(b)))
+            linhas.append("{" + " ".join(celulas) + "}")
+        self._img.put(" ".join(linhas))
+
+    def _agendar_redesenho(self):
+        """Junta vários pedidos seguidos (ex.: arrastar a barra) em um só redesenho."""
+        if self._redesenho_pendente:
+            return
+        self._redesenho_pendente = True
+
+        def feito():
+            self._redesenho_pendente = False
+            try:
+                self._desenhar_roda()
+            except tk.TclError:
+                pass
+        self.after_idle(feito)
+
+    def _atualizar_marcador(self):
+        ang = self._h * 2 * math.pi
+        dist = self._s * self.raio
+        px = self.cx + math.cos(ang) * dist
+        py = self.cy - math.sin(ang) * dist
+        r = self.RAIO_MARCADOR
+        self.coords(self._m_fora, px - r - 1, py - r - 1, px + r + 1, py + r + 1)
+        self.coords(self._m_dentro, px - r, py - r, px + r, py + r)
+        self.itemconfig(self._m_dentro, fill=self.get_hex())
+
+    def _notificar(self):
+        if self.comando:
+            self.comando(self.get_hex())
+
+    # ---- mouse ---------------------------------------------------------
+    def _clique(self, e):
+        dist = math.hypot(e.x - self.cx, e.y - self.cy)
+        if dist > self.raio + 6:          # clicou fora da roda: ignora
+            self._arrastando = False
+            return
+        self._arrastando = True
+        self._apontar(e.x, e.y)
+
+    def _arrasto(self, e):
+        if self._arrastando:
+            self._apontar(e.x, e.y)
+
+    def _soltar(self, e):
+        self._arrastando = False
+
+    def _apontar(self, x, y):
+        """Converte (x, y) em matiz/saturação, travando o ponto dentro do círculo."""
+        dx, dy = x - self.cx, y - self.cy
+        dist = math.hypot(dx, dy)
+        if dist > self.raio:              # limite: projeta na borda da roda
+            dx *= self.raio / dist
+            dy *= self.raio / dist
+            dist = self.raio
+        if dist > 0:                      # no centro exato o matiz é indefinido: mantém
+            self._h = (math.atan2(-dy, dx) / (2 * math.pi)) % 1.0
+        self._s = dist / self.raio
+        self._atualizar_marcador()
+        self._notificar()
+
+    # ---- API pública ---------------------------------------------------
+    def get_hex(self):
+        return hsv_para_hex(self._h, self._s, self._v)
+
+    def get_hsv(self):
+        return self._h, self._s, self._v
+
+    def set_color(self, cor, notificar=True):
+        """Define a cor por hexadecimal. Devolve False se o valor for inválido."""
+        hx = hex_valido(cor)
+        if not hx:
+            return False
+        h, s, v = hex_para_hsv(hx)
+        if s > 0 and v > 0:               # cinza/preto não têm matiz: mantém o anterior
+            self._h = h
+        self._s, self._v = s, v
+        self._desenhar_roda()
+        self._atualizar_marcador()
+        if notificar:
+            self._notificar()
+        return True
+
+    def set_valor(self, v, notificar=True):
+        """Define o brilho (0..1) mantendo matiz e saturação."""
+        self._v = max(0.0, min(1.0, v))
+        self._agendar_redesenho()
+        self._atualizar_marcador()
+        if notificar:
+            self._notificar()
+
+    def set_bg(self, bg):
+        """Muda a cor de fundo ao redor da roda (use o fundo do tema)."""
+        self._bg = bg
+        self.config(bg=bg)
+        self._desenhar_roda()
+
+
+# ----------------------------------------------------------------- brilho
+class BarraBrilho(tk.Canvas):
+    """Barra horizontal de brilho: preto -> cor pura (para o matiz/saturação atuais)."""
+    PAD = 8
+
+    def __init__(self, pai, largura=184, altura=16, bg="#ffffff", comando=None):
+        super().__init__(pai, width=largura + 2 * self.PAD, height=altura + 10, bg=bg,
+                         highlightthickness=0, bd=0, cursor="sb_h_double_arrow")
+        self.largura, self.altura, self.comando = largura, altura, comando
+        self._v = 1.0
+        self._chave = None
+        y1, y2 = 5, 5 + altura
+        self._y1, self._y2 = y1, y2
+        self._linhas = [self.create_line(self.PAD + i, y1, self.PAD + i, y2)
+                        for i in range(largura)]
+        self._alca_fora = self.create_rectangle(0, 0, 0, 0, outline="#000000", width=1)
+        self._alca = self.create_rectangle(0, 0, 0, 0, outline="#ffffff", width=2)
+        self.bind("<Button-1>", self._mouse)
+        self.bind("<B1-Motion>", self._mouse)
+        self.definir(0.0, 0.0, 1.0)
+
+    def _mouse(self, e):
+        v = (e.x - self.PAD) / max(1, self.largura - 1)
+        v = max(0.0, min(1.0, v))
+        self._posicionar(v)
+        if self.comando:
+            self.comando(v)
+
+    def _posicionar(self, v):
+        self._v = v
+        x = self.PAD + v * (self.largura - 1)
+        self.coords(self._alca_fora, x - 4, self._y1 - 4, x + 4, self._y2 + 4)
+        self.coords(self._alca, x - 3, self._y1 - 3, x + 3, self._y2 + 3)
+
+    def definir(self, h, s, v):
+        """Atualiza o degradê (se matiz/saturação mudaram) e a posição da alça."""
+        chave = (round(h, 3), round(s, 3))
+        if chave != self._chave:
+            self._chave = chave
+            n = max(1, self.largura - 1)
+            for i, item in enumerate(self._linhas):
+                self.itemconfig(item, fill=hsv_para_hex(h, s, i / n))
+        self._posicionar(v)
+
+
+# --------------------------------------------------------- seletor composto
+class SeletorCor(tk.Frame):
+    """Roda + barra de brilho + amostra + campo hexadecimal.
+
+    Parâmetros de aparência são cores simples (#rrggbb) para não depender do seu tema.
+    comando(hex) é chamado a cada mudança (clique, arraste, brilho ou digitação).
+    """
+
+    def __init__(self, pai, bg="#f3f4f8", card="#ffffff", fg="#1f2933", suave="#6b7785",
+                 borda="#e2e5ec", acento="#4f6df5", fonte=None, cor_inicial="#4f6df5",
+                 tamanho=200, comando=None):
+        super().__init__(pai, bg=bg)
+        self.comando = comando
+        fonte = fonte or tkfont.nametofont("TkDefaultFont").actual("family")
+        self._editando = False
+
+        self.roda = RodaDeCores(self, tamanho=tamanho, bg=bg, cor_inicial=cor_inicial,
+                                comando=self._mudou)
+        self.roda.pack()
+        self.barra = BarraBrilho(self, largura=tamanho - 2 * BarraBrilho.PAD, bg=bg,
+                                 comando=self.roda.set_valor)
+        self.barra.pack(pady=(4, 0))
+
+        linha = tk.Frame(self, bg=bg)
+        linha.pack(fill="x", pady=(10, 0))
+        self.amostra = tk.Frame(linha, width=40, height=30, bg=cor_inicial,
+                                highlightthickness=1, highlightbackground=borda)
+        self.amostra.pack(side="left")
+        self.amostra.pack_propagate(False)
+
+        moldura = tk.Frame(linha, bg=card, highlightthickness=1,
+                           highlightbackground=borda, highlightcolor=acento)
+        moldura.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        self._var = tk.StringVar()
+        self.entrada = tk.Entry(moldura, textvariable=self._var, relief="flat", bd=0,
+                                bg=card, fg=fg, insertbackground=fg, font=(fonte, 11),
+                                highlightthickness=0, width=9)
+        self.entrada.pack(fill="x", padx=8, pady=5)
+        self.entrada.bind("<KeyRelease>", self._digitado)
+        self.entrada.bind("<Return>", self._confirmar_texto)
+        self.entrada.bind("<FocusOut>", self._confirmar_texto)
+        self.entrada.bind("<FocusIn>", lambda e: moldura.config(highlightbackground=acento))
+        self.entrada.bind("<FocusOut>", lambda e: moldura.config(highlightbackground=borda), add="+")
+
+        self._atualizar_partes(self.roda.get_hex())
+
+    # ---- sincronização -------------------------------------------------
+    def _atualizar_partes(self, hx):
+        h, s, v = self.roda.get_hsv()
+        self.barra.definir(h, s, v)
+        self.amostra.config(bg=hx)
+        if not self._editando:
+            self._var.set(hx.upper())
+
+    def _mudou(self, hx):
+        self._atualizar_partes(hx)
+        if self.comando:
+            self.comando(hx)
+
+    def _digitado(self, e=None):
+        """Aplica a cor assim que houver 6 dígitos hex válidos (sem reescrever o campo)."""
+        texto = self._var.get().strip()
+        if re.fullmatch(r"#?[0-9a-fA-F]{6}", texto):
+            self._editando = True
+            try:
+                self.roda.set_color(texto)
+            finally:
+                self._editando = False
+
+    def _confirmar_texto(self, e=None):
+        hx = hex_valido(self._var.get())
+        if hx:
+            self.roda.set_color(hx)
+        self._var.set(self.roda.get_hex().upper())     # normaliza / desfaz valor inválido
+
+    # ---- API pública ---------------------------------------------------
+    def get_hex(self):
+        return self.roda.get_hex()
+
+    def set_color(self, cor):
+        return self.roda.set_color(cor)
+
+
+# ----------------------------------------------------------------- diálogo
+def _botao(pai, texto, comando, bg, fg, hover, fonte, negrito=False, px=14, py=7):
+    b = tk.Label(pai, text=texto, bg=bg, fg=fg, padx=px, pady=py, cursor="hand2",
+                 font=(fonte, 10, "bold" if negrito else "normal"))
+    b.bind("<Enter>", lambda e: b.config(bg=hover))
+    b.bind("<Leave>", lambda e: b.config(bg=bg))
+    b.bind("<Button-1>", lambda e: comando())
+    return b
+
+
+class DialogoCor(tk.Toplevel):
+    """Janela modal para escolher a cor do tema."""
+
+    def __init__(self, pai, c, fonte, cor_atual, tema="claro", ao_mudar=None):
+        super().__init__(pai, bg=c["bg"])
+        self.c, self.f, self.tema = c, fonte, tema
+        self.ao_mudar = ao_mudar
+        self.resultado = None
+        self.title("Cor do tema")
+        self.geometry("340x600")
+        self.resizable(False, False)
+        self.transient(pai)
+
+        corpo = tk.Frame(self, bg=c["bg"])
+        corpo.pack(fill="both", expand=True, padx=16, pady=14)
+
+        tk.Label(corpo, text="Cor do tema", bg=c["bg"], fg=c["texto"],
+                 font=(fonte, 13, "bold")).pack(anchor="w")
+        tk.Label(corpo, text="Clique e arraste na roda. A barra ajusta o brilho.",
+                 bg=c["bg"], fg=c["suave"], font=(fonte, 9)).pack(anchor="w", pady=(2, 10))
+
+        self.seletor = SeletorCor(corpo, bg=c["bg"], card=c["card"], fg=c["texto"],
+                                  suave=c["suave"], borda=c["borda"], acento=c["acento"],
+                                  fonte=fonte, cor_inicial=cor_atual, tamanho=220,
+                                  comando=self._previa)
+        self.seletor.pack()
+
+        # Prévia em tempo real
+        tk.Label(corpo, text="Prévia", bg=c["bg"], fg=c["suave"],
+                 font=(fonte, 9, "bold")).pack(anchor="w", pady=(14, 4))
+        prev = tk.Frame(corpo, bg=c["card"], highlightthickness=1,
+                        highlightbackground=c["borda"])
+        prev.pack(fill="x")
+        interno = tk.Frame(prev, bg=c["card"])
+        interno.pack(fill="x", padx=10, pady=8)
+        self.prev_cat = tk.Label(interno, text="CATEGORIA", bg=c["card"], fg=c["acento"],
+                                 font=(fonte, 8, "bold"))
+        self.prev_cat.pack(side="left")
+        self.prev_btn = tk.Label(interno, text="+ Nova", bg=c["acento"], fg=c["acento_txt"],
+                                 padx=12, pady=4, font=(fonte, 10, "bold"))
+        self.prev_btn.pack(side="right")
+        self._pintar_previa(self.seletor.get_hex())
+
+        rodape = tk.Frame(corpo, bg=c["bg"])
+        rodape.pack(fill="x", side="bottom")
+        _botao(rodape, "Aplicar", self.ok, c["acento"], c["acento_txt"], c["acento_hover"],
+               fonte, True, 18, 8).pack(side="right")
+        _botao(rodape, "Cancelar", self.destroy, c["chip"], c["texto"], c["borda"],
+               fonte, False, 14, 8).pack(side="right", padx=8)
+        _botao(rodape, "Padrão", self.padrao, c["chip"], c["texto"], c["borda"],
+               fonte, False, 14, 8).pack(side="left")
+
+        self.bind("<Escape>", lambda e: self.destroy())
+        try:
+            self.wait_visibility()
+            self.grab_set()
+        except tk.TclError:
+            pass
+        self.wait_window()
+
+    def _pintar_previa(self, hx):
+        d = derivar_acento(hx, self.tema)
+        self.prev_btn.config(bg=d["acento"], fg=d["acento_txt"])
+        self.prev_cat.config(fg=d["acento"])
+
+    def _previa(self, hx):
+        self._pintar_previa(hx)
+        if self.ao_mudar:
+            self.ao_mudar(hx)
+
+    def ok(self):
+        self.resultado = self.seletor.get_hex()
+        self.destroy()
+
+    def padrao(self):
+        self.resultado = ""
+        self.destroy()
+
+
+# ------------------------------------------------------------------ tela de configurações
+class DialogoConfiguracoes(tk.Toplevel):
+    """Janela modal de configurações gerais do aplicativo."""
+
+    def __init__(self, pai, c, fonte, tema):
+        super().__init__(pai, bg=c["bg"])
+        self.c, self.f, self.tema = c, fonte, tema
+        self.title("Configurações")
+        self.geometry("345x325")
+        self.resizable(False, False)
+        self.transient(pai)
+
+        corpo = tk.Frame(self, bg=c["bg"])
+        corpo.pack(fill="both", expand=True, padx=16, pady=16)
+
+        tk.Label(corpo, text="Configurações", bg=c["bg"], fg=c["texto"],
+                 font=(fonte, 13, "bold")).pack(anchor="w", pady=(0, 14))
+
+        # Seção Aparência
+        tk.Label(corpo, text="APARÊNCIA", bg=c["bg"], fg=c["suave"],
+                 font=(fonte, 9, "bold")).pack(anchor="w", pady=(0, 6))
+
+        moldura_card = tk.Frame(corpo, bg=c["card"], highlightthickness=1,
+                                highlightbackground=c["borda"])
+        moldura_card.pack(fill="x", pady=(0, 14))
+
+        sub_card = tk.Frame(moldura_card, bg=c["card"])
+        sub_card.pack(fill="x", padx=12, pady=10)
+
+        tk.Label(sub_card, text="Personalizar cores do tema", bg=c["card"], fg=c["texto"],
+                 font=(fonte, 10)).pack(side="left")
+
+        btn_cor = tk.Label(sub_card, text="Alterar", bg=c["acento"], fg=c["acento_txt"],
+                           padx=10, pady=4, font=(fonte, 9, "bold"), cursor="hand2")
+        btn_cor.pack(side="right")
+        btn_cor.bind("<Button-1>", lambda e: self.abrir_seletor_cor())
+
+        # Seção Comportamento
+        tk.Label(corpo, text="COMPORTAMENTO", bg=c["bg"], fg=c["suave"],
+                 font=(fonte, 9, "bold")).pack(anchor="w", pady=(0, 6))
+
+        moldura_copia = tk.Frame(corpo, bg=c["card"], highlightthickness=1,
+                                 highlightbackground=c["borda"])
+        moldura_copia.pack(fill="x", pady=(0, 14))
+
+        sub_copia = tk.Frame(moldura_copia, bg=c["card"])
+        sub_copia.pack(fill="x", padx=12, pady=10)
+
+        tk.Label(sub_copia, text="Intervalo entre cópias (1.5s)", bg=c["card"], fg=c["texto"],
+                 font=(fonte, 10)).pack(side="left")
+
+        usando = self.master.cfg.get("usar_intervalo", True)
+        self.btn_intervalo_texto = tk.StringVar(value="Ativado" if usando else "Desativado")
+        
+        self.btn_intervalo = tk.Label(
+            sub_copia,
+            textvariable=self.btn_intervalo_texto,
+            bg=c["acento"] if usando else c["chip"],
+            fg=c["acento_txt"] if usando else c["texto"],
+            padx=10, pady=4, font=(fonte, 9, "bold"), cursor="hand2"
+        )
+        self.btn_intervalo.pack(side="right")
+        self.btn_intervalo.bind("<Button-1>", lambda e: self.alternar_intervalo())
+
+        # Rodapé
+        rodape = tk.Frame(corpo, bg=c["bg"])
+        rodape.pack(fill="x", side="bottom")
+        _botao(rodape, "Fechar", self.destroy, c["chip"], c["texto"], c["borda"],
+               fonte, False, 16, 7).pack(side="right")
+
+        self.bind("<Escape>", lambda e: self.destroy())
+        try:
+            self.wait_visibility()
+            self.grab_set()
+        except tk.TclError:
+            pass
+        self.wait_window()
+
+    def alternar_intervalo(self):
+        atual = self.master.cfg.get("usar_intervalo", True)
+        novo = not atual
+        self.master.cfg["usar_intervalo"] = novo
+        _gravar(ARQUIVO_CFG, self.master.cfg)
+        
+        c = self.c
+        if novo:
+            self.btn_intervalo_texto.set("Ativado")
+            self.btn_intervalo.config(bg=c["acento"], fg=c["acento_txt"])
+        else:
+            self.btn_intervalo_texto.set("Desativado")
+            self.btn_intervalo.config(bg=c["chip"], fg=c["texto"])
+
+    def abrir_seletor_cor(self):
+        cor_atual = self.master.cfg.get("cor_personalizada") or TEMAS[self.tema]["acento"]
+        dialogo = DialogoCor(self, self.c, self.f, cor_atual, tema=self.tema)
+        resultado = dialogo.resultado
+
+        if resultado is None:
+            return
+
+        if resultado == "":
+            self.master.cfg.pop("cor_personalizada", None)
+        else:
+            self.master.cfg["cor_personalizada"] = resultado
+
+        _gravar(ARQUIVO_CFG, self.master.cfg)
+        self.master.construir()
+        self.destroy()
+        self.master.mostrar_rodape(
+            "Cor padrão restaurada" if resultado == ""
+            else f"Cor do tema alterada para {resultado.upper()}",
+            self.master.c["acento"],
+            volta="clique para copiar"
+        )
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -554,6 +1127,8 @@ class App(tk.Tk):
         self.dados = _ler(ARQUIVO, list(EXEMPLOS))
         self.cfg = _ler(ARQUIVO_CFG, {})
         self.tema = self.cfg.get("tema", "claro")
+        if self.tema not in TEMAS:
+            self.tema = "claro"
         self.fixado = bool(self.cfg.get("fixado", False))
         self.categoria = "Todas"
         self.busca = tk.StringVar()
@@ -775,15 +1350,23 @@ class App(tk.Tk):
         self.cache = {}
         self.cartoes_widgets = []
         self.chip_labels = {}
-        c = self.c = TEMAS[self.tema]
+        c = dict(TEMAS[self.tema])
+        cor_salva = self.cfg.get("cor_personalizada")
+        if cor_salva:
+            c.update(derivar_acento(cor_salva, self.tema))
+        self.c = c
         f = self.f
         self.configure(bg=c["bg"])
 
-        # Cabeçalho: [título] ............ [+ Nova] [cadeado] [tema]
+        # Cabeçalho: [título] ............ [+ Nova] [cadeado] [tema] [engrenagem]
         topo = tk.Frame(self, bg=c["bg"])
         topo.pack(fill="x", padx=14, pady=(14, 8))
         tk.Label(topo, text="Frases Prontas", bg=c["bg"], fg=c["texto"],
                  font=(f, 15, "bold")).pack(side="left")
+
+        # Botão de Configurações (Engrenagem)
+        IconeBotao(topo, "engrenagem", self.abrir_configuracoes,
+                   c["chip"], c["texto"], c["borda"]).pack(side="right", padx=(8, 0))
 
         # (ordem de empacotamento com side="right": o primeiro fica mais à direita)
         IconeBotao(topo, "lua" if self.tema == "claro" else "sol", self.alternar_tema,
@@ -1038,7 +1621,7 @@ class App(tk.Tk):
             pass
         if self.fixado:
             try:
-                jan.attributes("-topmost", True)   # fica acima da janela principal fixada
+                jan.attributes("-topmost", True)
             except tk.TclError:
                 pass
         jan.deiconify()
@@ -1159,18 +1742,18 @@ class App(tk.Tk):
             elif self.clip_externo and self.clip_externo.copiar(texto):
                 return True
         except Exception:
-            pass                     # cai no clipboard do Tkinter abaixo
+            pass
 
         try:
             self.clipboard_clear()
             self.clipboard_append(texto)
-            self.update_idletasks()  # (sem update(): evita reentrância em cliques rápidos)
+            self.update_idletasks()
             return True
         except tk.TclError:
             return False
 
     def _tremer_cartao(self, card):
-        """Pisca o cartão em vermelho e balança de um lado para o outro (sem travar nada)."""
+        """Pisca o cartão em vermelho e balança de um lado para o outro."""
         if getattr(card, "tremendo", False):
             return
         c = self.c
@@ -1183,7 +1766,6 @@ class App(tk.Tk):
 
         borda_antes = (card.cget("highlightbackground"), card.cget("highlightcolor"))
         widgets = list(todos(card))
-        # deslocamento à direita, em pixels (termina em 0 = posição original)
         desloc = [8, 0, 8, 0, 6, 0, 4, 0, 2, 0]
 
         def pintar(cor_fundo, cor_borda):
@@ -1208,7 +1790,7 @@ class App(tk.Tk):
                 l = desloc[i]
                 if card.winfo_manager() == "pack":
                     card.pack_configure(padx=(l, 8 - l))
-                if (i // 2) % 2 == 0 and i < 8:        # pisca: vermelho, normal, vermelho...
+                if (i // 2) % 2 == 0 and i < 8:
                     pintar(c["alerta"], c["perigo"])
                 else:
                     pintar(c["card"], c["perigo"] if i < 8 else borda_antes[0])
@@ -1223,8 +1805,8 @@ class App(tk.Tk):
         if i < 0:
             return
 
-        # Intervalo mínimo entre cópias: dentro dele, só avisa (não copia, não bloqueia)
-        if time.monotonic() - self._ultima_copia < INTERVALO_COPIA:
+        usar_intervalo = self.cfg.get("usar_intervalo", True)
+        if usar_intervalo and (time.monotonic() - self._ultima_copia < INTERVALO_COPIA):
             self._tremer_cartao(card)
             self.mostrar_rodape("Aguarde um instante para copiar de novo", c["perigo"],
                                 volta="clique para copiar")
@@ -1248,7 +1830,6 @@ class App(tk.Tk):
             except tk.TclError:
                 pass
 
-        # Cliques repetidos no mesmo cartão: o aviso antigo não pode apagar o novo
         anterior = getattr(card, "restaurar_id", None)
         if anterior:
             self.after_cancel(anterior)
@@ -1284,6 +1865,10 @@ class App(tk.Tk):
             self.listar()
         else:
             self.resetar_destaques()
+
+    def abrir_configuracoes(self):
+        """Abre a tela de opções de configuração."""
+        DialogoConfiguracoes(self, self.c, self.f, self.tema)
 
     def alternar_tema(self):
         self.tema = "escuro" if self.tema == "claro" else "claro"
