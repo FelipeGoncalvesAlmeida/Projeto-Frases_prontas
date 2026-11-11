@@ -23,10 +23,13 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import tkinter as tk
 from tkinter import font as tkfont
 from tkinter import messagebox
+
+DEBUG = bool(os.environ.get("FRASES_DEBUG"))      # FRASES_DEBUG=1 mostra o que decide recolher
 
 LINUX = sys.platform.startswith("linux")
 WINDOWS = sys.platform.startswith("win")
@@ -290,9 +293,34 @@ def _monitores_windows():
     return mons
 
 
+_MON = {"dados": None, "t": 0.0, "ocupado": False}
+
+
+def _atualizar_monitores():
+    try:
+        mons = _monitores_windows() if WINDOWS else _monitores_linux()
+    except Exception:
+        mons = []
+    if mons:
+        _MON["dados"] = mons
+    _MON["t"] = time.monotonic()
+    _MON["ocupado"] = False
+
+
+def precarregar_monitores():
+    """Consulta os monitores em outra thread (o xrandr pode demorar segundos)."""
+    if _MON["ocupado"]:
+        return
+    _MON["ocupado"] = True
+    threading.Thread(target=_atualizar_monitores, daemon=True).start()
+
+
 def listar_monitores(root):
-    """Retorna [(x, y, largura, altura), ...] de cada monitor conectado."""
-    mons = _monitores_windows() if WINDOWS else _monitores_linux()
+    """Retorna [(x, y, largura, altura), ...] de cada monitor conectado.
+    Nunca bloqueia: usa o último resultado conhecido e atualiza em segundo plano."""
+    if time.monotonic() - _MON["t"] > 5:
+        precarregar_monitores()
+    mons = _MON["dados"]
     if not mons:
         mons = [(0, 0, root.winfo_screenwidth(), root.winfo_screenheight())]
     return mons
@@ -323,8 +351,17 @@ def botao(pai, texto, comando, bg, fg, hover, fonte, negrito=False, px=14, py=7)
     return b
 
 
+def retangulo_arredondado(canvas, x1, y1, x2, y2, r, **kw):
+    """Desenha um retângulo com cantos arredondados no canvas."""
+    pts = [x1 + r, y1, x1 + r, y1, x2 - r, y1, x2 - r, y1, x2, y1,
+           x2, y1 + r, x2, y1 + r, x2, y2 - r, x2, y2 - r, x2, y2,
+           x2 - r, y2, x2 - r, y2, x1 + r, y2, x1 + r, y2, x1, y2,
+           x1, y2 - r, x1, y2 - r, x1, y1 + r, x1, y1 + r, x1, y1]
+    return canvas.create_polygon(pts, smooth=True, **kw)
+
+
 def desenhar_icone(cv, tipo, ox, oy, s, cor, bg):
-    """Desenha um ícone simples no canvas (idêntico em qualquer sistema).
+    """Desenha um ícone de contorno no canvas (idêntico em qualquer sistema).
     ox, oy = canto superior esquerdo; s = tamanho; cor = traço; bg = fundo atual."""
     def P(x, y):
         return ox + x * s, oy + y * s
@@ -332,7 +369,8 @@ def desenhar_icone(cv, tipo, ox, oy, s, cor, bg):
     w = max(2, round(s / 8))
 
     if tipo in ("cadeado", "aberto"):
-        cv.create_rectangle(*P(.2, .46), *P(.8, .92), fill=cor, outline=cor)
+        retangulo_arredondado(cv, *P(.18, .46), *P(.82, .92), max(1, s * .08),
+                              fill="", outline=cor, width=w)
         if tipo == "cadeado":
             cv.create_arc(*P(.3, .10), *P(.7, .62), start=0, extent=180,
                           style="arc", outline=cor, width=w)
@@ -342,19 +380,22 @@ def desenhar_icone(cv, tipo, ox, oy, s, cor, bg):
             cv.create_arc(*P(.3, .0), *P(.7, .52), start=0, extent=180,
                           style="arc", outline=cor, width=w)
             cv.create_line(*P(.3, .26), *P(.3, .48), fill=cor, width=w)
-        cv.create_oval(*P(.44, .60), *P(.56, .74), fill=bg, outline=bg)
+        cv.create_oval(*P(.43, .62), *P(.57, .76), fill=cor, outline=cor)
 
     elif tipo == "lua":
         cv.create_oval(*P(.15, .15), *P(.85, .85), fill=cor, outline=cor)
         cv.create_oval(*P(.38, .04), *P(1.0, .68), fill=bg, outline=bg)
 
     elif tipo == "sol":
-        cv.create_oval(*P(.30, .30), *P(.70, .70), fill=cor, outline=cor)
+        # círculo com metade preenchida + 8 raios (estilo "contraste")
+        cv.create_oval(*P(.28, .28), *P(.72, .72), outline=cor, width=w)
+        cv.create_arc(*P(.28, .28), *P(.72, .72), start=90, extent=180,
+                      fill=cor, outline=cor)
         for i in range(8):
             a = i * math.pi / 4
-            cv.create_line(*P(.5 + .33 * math.cos(a), .5 + .33 * math.sin(a)),
-                           *P(.5 + .48 * math.cos(a), .5 + .48 * math.sin(a)),
-                           fill=cor, width=w)
+            cv.create_line(*P(.5 + .35 * math.cos(a), .5 + .35 * math.sin(a)),
+                           *P(.5 + .49 * math.cos(a), .5 + .49 * math.sin(a)),
+                           fill=cor, width=w, capstyle="round")
 
     elif tipo == "grip":
         r = .09
@@ -363,24 +404,36 @@ def desenhar_icone(cv, tipo, ox, oy, s, cor, bg):
                 cv.create_oval(*P(cx - r, cy - r), *P(cx + r, cy + r), fill=cor, outline=cor)
 
     elif tipo == "engrenagem":
-        cv.create_oval(*P(.28, .28), *P(.72, .72), fill=bg, outline=cor, width=w)
-        cv.create_oval(*P(.42, .42), *P(.58, .58), fill=cor, outline=cor)
-        for i in range(6):
-            a = i * math.pi / 3
-            cv.create_line(*P(.5 + .28 * math.cos(a), .5 + .28 * math.sin(a)),
-                           *P(.5 + .48 * math.cos(a), .5 + .48 * math.sin(a)),
-                           fill=cor, width=max(2, w - 1))
+        pts = []
+        dentes = 8
+        for i in range(dentes):
+            a = i * 2 * math.pi / dentes
+            for da, rr in ((-.30, .34), (-.17, .48), (.17, .48), (.30, .34)):
+                ang = a + da
+                pts.extend(P(.5 + rr * math.cos(ang), .5 + rr * math.sin(ang)))
+        fino = max(1, w - 1)
+        cv.create_polygon(*pts, fill="", outline=cor, width=fino, joinstyle="round")
+        cv.create_oval(*P(.37, .37), *P(.63, .63), outline=cor, width=fino)
+
+    elif tipo == "lupa":
+        cv.create_oval(*P(.12, .12), *P(.64, .64), outline=cor, width=w)
+        cv.create_line(*P(.58, .58), *P(.88, .88), fill=cor, width=w, capstyle="round")
 
 
 class IconeBotao(tk.Canvas):
-    """Botão com ícone desenhado, com efeito de hover."""
+    """Botão com ícone desenhado, com efeito de hover.
+    Se 'borda' for informada, o fundo vira um quadrado de cantos arredondados."""
 
-    def __init__(self, pai, tipo, comando, bg, fg, hover, tam=16, px=9, py=5, cursor="hand2"):
-        super().__init__(pai, width=tam + 2 * px, height=tam + 2 * py, bg=bg,
+    def __init__(self, pai, tipo, comando, bg, fg, hover, tam=16, px=9, py=5,
+                 cursor="hand2", borda=None, raio=8, bg_pai=None):
+        larg, alt = tam + 2 * px, tam + 2 * py
+        super().__init__(pai, width=larg, height=alt, bg=bg_pai or bg,
                          highlightthickness=0, bd=0, cursor=cursor)
         self._tipo, self._cmd = tipo, comando
         self._bg, self._fg, self._hover = bg, fg, hover
         self._tam, self._px, self._py = tam, px, py
+        self._larg, self._alt = larg, alt
+        self._borda, self._raio, self._bg_pai = borda, raio, bg_pai
         self._sobre = False
         self.bind("<Enter>", lambda e: self._set_sobre(True))
         self.bind("<Leave>", lambda e: self._set_sobre(False))
@@ -393,12 +446,403 @@ class IconeBotao(tk.Canvas):
 
     def _desenhar(self):
         bg = self._hover if self._sobre else self._bg
-        self.config(bg=bg)
         self.delete("all")
+        if self._borda is not None:
+            self.config(bg=self._bg_pai or self._bg)
+            retangulo_arredondado(self, 1, 1, self._larg - 1, self._alt - 1, self._raio,
+                                  fill=bg, outline=self._borda)
+        else:
+            self.config(bg=bg)
         desenhar_icone(self, self._tipo, self._px, self._py, self._tam, self._fg, bg)
 
-    def configurar(self, tipo, bg, fg, hover):
+    def configurar(self, tipo, bg, fg, hover, borda=None):
         self._tipo, self._bg, self._fg, self._hover = tipo, bg, fg, hover
+        if borda is not None:
+            self._borda = borda
+        self._desenhar()
+
+
+class BotaoArredondado(tk.Canvas):
+    """Botão de texto com cantos arredondados e efeito de hover."""
+
+    def __init__(self, pai, texto, comando, bg, fg, hover, fonte, bg_pai,
+                 negrito=False, px=14, py=7, raio=8):
+        fonte_obj = tkfont.Font(family=fonte, size=10, weight="bold" if negrito else "normal")
+        larg = fonte_obj.measure(texto) + 2 * px
+        alt = fonte_obj.metrics("linespace") + 2 * py
+        super().__init__(pai, width=larg, height=alt, bg=bg_pai,
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self._fonte_obj = fonte_obj          # precisa ficar guardada, senão o Tk apaga a fonte
+        self._texto, self._cmd = texto, comando
+        self._bg, self._fg, self._hover = bg, fg, hover
+        self._larg, self._alt, self._raio = larg, alt, raio
+        self._sobre = False
+        self.bind("<Enter>", lambda e: self._set_sobre(True))
+        self.bind("<Leave>", lambda e: self._set_sobre(False))
+        self.bind("<Button-1>", lambda e: self._cmd())
+        self._desenhar()
+
+    def _set_sobre(self, valor):
+        self._sobre = valor
+        self._desenhar()
+
+    def _desenhar(self):
+        self.delete("all")
+        cor = self._hover if self._sobre else self._bg
+        retangulo_arredondado(self, 1, 1, self._larg - 1, self._alt - 1, self._raio,
+                              fill=cor, outline=cor)
+        self.create_text(self._larg / 2, self._alt / 2, text=self._texto,
+                         font=self._fonte_obj, fill=self._fg)
+
+
+class Arredondado(tk.Canvas):
+    """Moldura de cantos arredondados que cresce conforme o conteúdo.
+    Coloque os widgets dentro de self.interno."""
+
+    def __init__(self, pai, bg_pai, fill, borda, raio=9, pad=4, cursor=""):
+        super().__init__(pai, width=1, height=2 * pad + 2, bg=bg_pai,
+                         highlightthickness=0, bd=0, cursor=cursor)
+        self._raio, self._pad = raio, pad
+        self._cor_fill, self._cor_borda = fill, borda
+        self._larg = self._alt = 0
+        self._alt_pedida = 0
+        self._forma = None
+        # o 'pad' impede que o canto quadrado do conteúdo apareça fora da curva
+        self.interno = tk.Frame(self, bg=fill, cursor=cursor)
+        self._janela = self.create_window(pad, pad, window=self.interno, anchor="nw")
+        self.bind("<Configure>", self._ao_canvas)
+        self.interno.bind("<Configure>", self._ao_interno)
+
+    def _ao_canvas(self, e):
+        self._larg, self._alt = e.width, e.height
+        self.itemconfigure(self._janela, width=max(1, e.width - 2 * self._pad))
+        self.coords(self._janela, self._pad, self._pad)
+        self._desenhar()
+
+    def _ao_interno(self, e=None):
+        h = self.interno.winfo_reqheight() + 2 * self._pad
+        if h != self._alt_pedida:
+            self._alt_pedida = h
+            self.config(height=h)
+
+    def _desenhar(self):
+        if self._forma is not None:
+            self.delete(self._forma)
+            self._forma = None
+        if self._larg < 4 or self._alt < 4:
+            return
+        self._forma = retangulo_arredondado(self, 1, 1, self._larg - 1, self._alt - 1,
+                                            self._raio, fill=self._cor_fill,
+                                            outline=self._cor_borda, width=1)
+        self.tag_lower(self._forma)
+
+    def definir(self, fill=None, borda=None):
+        if fill is not None:
+            self._cor_fill = fill
+        if borda is not None:
+            self._cor_borda = borda
+        self.interno.config(bg=self._cor_fill)
+        if self._forma is not None:
+            self.itemconfigure(self._forma, fill=self._cor_fill, outline=self._cor_borda)
+
+
+class Chip(tk.Canvas):
+    """Categoria: texto simples quando inativa; pílula colorida com brilho quando ativa."""
+    HALO = 3
+
+    def __init__(self, pai, texto, fonte_n, fonte_b, cores, comando, px=11, py=5):
+        h = self.HALO
+        larg = fonte_b.measure(texto) + 2 * px + 2 * h     # sempre mede em negrito: não "pula"
+        alt = fonte_b.metrics("linespace") + 2 * py + 2 * h
+        super().__init__(pai, width=larg, height=alt, bg=cores["bg"],
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self._texto, self._fn, self._fb, self._cores = texto, fonte_n, fonte_b, cores
+        self._larg, self._alt = larg, alt
+        self._ativo = False
+        self._sobre = False
+        self.bind("<Enter>", lambda e: self._set_sobre(True))
+        self.bind("<Leave>", lambda e: self._set_sobre(False))
+        self.bind("<Button-1>", lambda e: comando())
+        self._desenhar()
+
+    def _set_sobre(self, valor):
+        self._sobre = valor
+        self._desenhar()
+
+    def definir(self, ativo):
+        self._ativo = ativo
+        self._desenhar()
+
+    def _desenhar(self):
+        self.delete("all")
+        w, h, hl, c = self._larg, self._alt, self.HALO, self._cores
+        if self._ativo:
+            retangulo_arredondado(self, 0, 0, w, h, 11, fill=c["halo"], outline="")
+            retangulo_arredondado(self, hl, hl, w - hl, h - hl, 9, fill=c["acento"], outline="")
+            self.create_text(w / 2, h / 2, text=self._texto, font=self._fb, fill=c["acento_txt"])
+        else:
+            if self._sobre:
+                retangulo_arredondado(self, hl, hl, w - hl, h - hl, 9, fill=c["chip"], outline="")
+            self.create_text(w / 2, h / 2, text=self._texto, font=self._fn, fill=c["texto"])
+
+
+class CartaoFrase(tk.Canvas):
+    """Cartão de frase desenhado em UM único Canvas (sem widgets filhos): bem mais leve
+    para criar, mostrar e redimensionar do que um Frame com vários Labels.
+    À direita fica o botão de três pontos (abre o menu Editar/Excluir)."""
+    X_TEXTO = 34
+    TOPO = 13
+
+    def __init__(self, pai, cores, d, fonte, largura_inicial, ao_copiar, ao_arrastar, ao_menu):
+        super().__init__(pai, width=1, height=40, bg=cores["bg"],
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self._cores, self._fonte = cores, fonte
+        self.d = d
+        self.data_index = -1
+        self.hover = False
+        self.fundo_forcado = None       # usado pela animação de "tremer"
+        self.borda_forcada = None       # usado pelo feedback de "copiado"
+        self.tremendo = False
+        self._ao_copiar, self._ao_arrastar, self._ao_menu = ao_copiar, ao_arrastar, ao_menu
+        self._larg = 0
+        self._h = 0
+        self._alt_pedida = 0
+        self._rect_menu = (0, 0, 0, 0)  # área clicável dos três pontos (x1, y1, x2, y2)
+        self._sobre_menu = False
+        self._cursor = "hand2"
+        self._forma = None
+        self._cor_fill, self._cor_borda = cores["card"], cores["borda"]
+        self._cor_btn = misturar(cores["card_hover"], cores["texto"], 0.14)
+
+        self._grip = [self.create_oval(0, 0, 0, 0, fill=cores["suave"], outline=cores["suave"])
+                      for _ in range(6)]
+        self._i_cat = self.create_text(0, 0, text=d["categoria"].upper(), anchor="nw",
+                                       fill=cores["acento"], font=(fonte, 8, "bold"))
+        self._i_txt = self.create_text(0, 0, text=d["texto"], anchor="nw", justify="left",
+                                       fill=cores["texto"], font=(fonte, 11))
+        # botão de três pontos: círculo de fundo (só no hover) + 3 pontinhos
+        self._i_btn = self.create_oval(0, 0, 0, 0, fill=self._cor_btn, outline=self._cor_btn,
+                                       state="hidden")
+        self._pts = [self.create_oval(0, 0, 0, 0, fill=cores["suave"], outline=cores["suave"])
+                     for _ in range(3)]
+
+        h = self._calcular(largura_inicial)
+        self._alt_pedida = h
+        self.config(height=h)
+
+        self.bind("<Configure>", self._ao_canvas)
+        self.bind("<Enter>", lambda e: self._set_hover(True))
+        self.bind("<Leave>", lambda e: self._set_hover(False))
+        self.bind("<Motion>", self._movimento)
+        self.bind("<Button-1>", self._clique)
+
+    # ---- layout --------------------------------------------------------
+    def _calcular(self, larg):
+        """Posiciona tudo para a largura dada e devolve a altura necessária."""
+        x_btn = larg - 22
+        quebra = max(60, (x_btn - 13) - 8 - self.X_TEXTO)
+        self.itemconfigure(self._i_txt, width=quebra)
+        self.coords(self._i_cat, self.X_TEXTO, self.TOPO)
+        y = self.bbox(self._i_cat)[3] + 2
+        self.coords(self._i_txt, self.X_TEXTO, y)
+        h = int(self.bbox(self._i_txt)[3] + self.TOPO)
+        self._h = h
+        ym = h / 2
+
+        k = 0
+        for gx in (12, 18):
+            for gy in (-7, 0, 7):
+                self.coords(self._grip[k], gx - 1.4, ym + gy - 1.4, gx + 1.4, ym + gy + 1.4)
+                k += 1
+
+        for k, dy in enumerate((-6, 0, 6)):
+            self.coords(self._pts[k], x_btn - 1.8, ym + dy - 1.8, x_btn + 1.8, ym + dy + 1.8)
+        self.coords(self._i_btn, x_btn - 13, ym - 13, x_btn + 13, ym + 13)
+        self._rect_menu = (x_btn - 13, ym - 16, x_btn + 13, ym + 16)
+        return h
+
+    def _ao_canvas(self, e):
+        self._larg = e.width
+        h = self._calcular(e.width)
+        if h != self._alt_pedida:
+            self._alt_pedida = h
+            self.config(height=h)
+        self._desenhar_forma()
+
+    def _desenhar_forma(self):
+        if self._forma is not None:
+            self.delete(self._forma)
+            self._forma = None
+        if self._larg < 4 or self._h < 4:
+            return
+        self._forma = retangulo_arredondado(self, 1, 1, self._larg - 1, self._h - 1, 9,
+                                            fill=self._cor_fill, outline=self._cor_borda, width=1)
+        self.tag_lower(self._forma)
+
+    def posicao_menu(self):
+        """Canto inferior direito do botão de três pontos, em coordenadas da tela."""
+        x1, y1, x2, y2 = self._rect_menu
+        return self.winfo_rootx() + x2, self.winfo_rooty() + y2, y2 - y1
+
+    # ---- estado visual -------------------------------------------------
+    def atualizar(self):
+        """Pinta o cartão conforme o estado: normal, hover, copiado ou alerta."""
+        c = self._cores
+        self._cor_fill = self.fundo_forcado or (c["card_hover"] if self.hover else c["card"])
+        self._cor_borda = self.borda_forcada or (c["borda_hover"] if self.hover else c["borda"])
+        if self._forma is not None:
+            self.itemconfigure(self._forma, fill=self._cor_fill, outline=self._cor_borda)
+
+    def set_categoria(self, texto, cor):
+        self.itemconfigure(self._i_cat, text=texto, fill=cor)
+
+    def _set_hover(self, valor):
+        if valor == self.hover:
+            return
+        self.hover = valor
+        if not valor:
+            self._pintar_menu(False)
+            if self._cursor != "hand2":
+                self._cursor = "hand2"
+                self.config(cursor="hand2")
+        self.atualizar()
+
+    def _pintar_menu(self, sobre):
+        if sobre == self._sobre_menu:
+            return
+        self._sobre_menu = sobre
+        c = self._cores
+        self.itemconfigure(self._i_btn, state="normal" if sobre else "hidden")
+        for item in self._pts:
+            cor = c["texto"] if sobre else c["suave"]
+            self.itemconfigure(item, fill=cor, outline=cor)
+
+    # ---- mouse ---------------------------------------------------------
+    def _zona(self, x, y):
+        if 4 <= x <= 28 and abs(y - self._h / 2) <= 15:      # só em volta dos pontinhos
+            return "grip"
+        x1, y1, x2, y2 = self._rect_menu
+        if x1 <= x <= x2 and y1 <= y <= y2:
+            return "menu"
+        return None
+
+    def _movimento(self, e):
+        if e.state & 0x100:                 # botão pressionado (arrastando): ignora
+            return
+        if not self.hover:
+            self._set_hover(True)
+        zona = self._zona(e.x, e.y)
+        cursor = "fleur" if zona == "grip" else "hand2"
+        if cursor != self._cursor:
+            self._cursor = cursor
+            self.config(cursor=cursor)
+        self._pintar_menu(zona == "menu")
+
+    def _clique(self, e):
+        zona = self._zona(e.x, e.y)
+        if zona == "grip":
+            self._ao_arrastar()
+        elif zona == "menu":
+            self._ao_menu()
+        else:
+            self._ao_copiar()
+
+
+class MenuPopup(tk.Toplevel):
+    """Menu flutuante simples (Editar / Excluir) com as cores do tema.
+    Não rouba o foco do app; quem abre é responsável por fechar (clique fora, Esc...)."""
+
+    def __init__(self, pai, c, fonte, itens, x_dir, y_base, altura_botao, ao_escolher):
+        super().__init__(pai, bg=c["borda_hover"])
+        self.withdraw()
+        self.overrideredirect(True)
+        interno = tk.Frame(self, bg=c["card"])
+        interno.pack(padx=1, pady=1)
+        for texto, cor, comando in itens:
+            l = tk.Label(interno, text=texto, bg=c["card"], fg=cor, font=(fonte, 10),
+                         anchor="w", padx=16, pady=7, cursor="hand2")
+            l.pack(fill="x")
+            l.bind("<Enter>", lambda e, l=l: l.config(bg=c["chip"]))
+            l.bind("<Leave>", lambda e, l=l: l.config(bg=c["card"]))
+            l.bind("<Button-1>", lambda e, cmd=comando: ao_escolher(cmd))
+        self.update_idletasks()
+        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        x = max(0, min(x_dir - w, sw - w))
+        y = y_base
+        if y + h > sh:                       # sem espaço embaixo: abre para cima
+            y = max(0, y_base - altura_botao - h)
+        self.geometry(f"+{int(x)}+{int(y)}")
+        try:
+            self.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        self.deiconify()
+
+
+class BarraRolagem(tk.Canvas):
+    """Barra de rolagem fina, sem setas, que só mostra o "polegar" quando há o que rolar.
+    Funciona como o tk.Scrollbar: use set() em yscrollcommand e passe yview em 'comando'."""
+
+    def __init__(self, pai, comando, bg, cor, cor_hover, largura=10, espessura=5):
+        super().__init__(pai, width=largura, bg=bg, highlightthickness=0, bd=0)
+        self._cmd = comando
+        self._cor, self._cor_hover = cor, cor_hover
+        self._esp, self._lar = espessura, largura
+        self._primeiro, self._ultimo = 0.0, 1.0
+        self._sobre = False
+        self._arrastando = False
+        self._desloc = 0.0
+        self.bind("<Configure>", lambda e: self._desenhar())
+        self.bind("<Button-1>", self._clique)
+        self.bind("<B1-Motion>", self._arrasto)
+        self.bind("<ButtonRelease-1>", self._soltar)
+        self.bind("<Enter>", lambda e: self._set_sobre(True))
+        self.bind("<Leave>", lambda e: self._set_sobre(False))
+
+    def set(self, primeiro, ultimo):
+        self._primeiro, self._ultimo = float(primeiro), float(ultimo)
+        self._desenhar()
+
+    def _set_sobre(self, valor):
+        self._sobre = valor
+        self._desenhar()
+
+    def _limites(self):
+        h = max(1, self.winfo_height())
+        y1 = self._primeiro * h
+        y2 = max(self._ultimo * h, y1 + 24)          # polegar nunca fica minúsculo
+        return h, y1, min(y2, h)
+
+    def _desenhar(self):
+        self.delete("all")
+        if self._ultimo - self._primeiro >= 0.999:    # tudo cabe: não mostra nada
+            return
+        h, y1, y2 = self._limites()
+        x1 = (self._lar - self._esp) / 2
+        cor = self._cor_hover if (self._sobre or self._arrastando) else self._cor
+        retangulo_arredondado(self, x1, y1, x1 + self._esp, y2, min(self._esp / 2, (y2 - y1) / 2),
+                              fill=cor, outline="")
+
+    def _clique(self, e):
+        h, y1, y2 = self._limites()
+        if y1 <= e.y <= y2:
+            self._arrastando = True
+            self._desloc = e.y - y1
+            self._desenhar()
+        elif e.y < y1:
+            self._cmd("scroll", -1, "pages")
+        else:
+            self._cmd("scroll", 1, "pages")
+
+    def _arrasto(self, e):
+        if not self._arrastando:
+            return
+        h = max(1, self.winfo_height())
+        self._cmd("moveto", max(0.0, (e.y - self._desloc) / h))
+
+    def _soltar(self, e):
+        self._arrastando = False
         self._desenhar()
 
 
@@ -416,15 +860,6 @@ def e_descendente(w, ancestral):
             return True
         w = w.master
     return False
-
-
-def retangulo_arredondado(canvas, x1, y1, x2, y2, r, **kw):
-    """Desenha um retângulo com cantos arredondados no canvas."""
-    pts = [x1 + r, y1, x1 + r, y1, x2 - r, y1, x2 - r, y1, x2, y1,
-           x2, y1 + r, x2, y1 + r, x2, y2 - r, x2, y2 - r, x2, y2,
-           x2 - r, y2, x2 - r, y2, x1 + r, y2, x1 + r, y2, x1, y2,
-           x1, y2 - r, x1, y2 - r, x1, y1 + r, x1, y1 + r, x1, y1]
-    return canvas.create_polygon(pts, smooth=True, **kw)
 
 
 class Dialogo(tk.Toplevel):
@@ -1055,7 +1490,7 @@ class DialogoConfiguracoes(tk.Toplevel):
 
         usando = self.master.cfg.get("usar_intervalo", True)
         self.btn_intervalo_texto = tk.StringVar(value="Ativado" if usando else "Desativado")
-        
+
         self.btn_intervalo = tk.Label(
             sub_copia,
             textvariable=self.btn_intervalo_texto,
@@ -1085,7 +1520,7 @@ class DialogoConfiguracoes(tk.Toplevel):
         novo = not atual
         self.master.cfg["usar_intervalo"] = novo
         _gravar(ARQUIVO_CFG, self.master.cfg)
-        
+
         c = self.c
         if novo:
             self.btn_intervalo_texto.set("Ativado")
@@ -1134,6 +1569,8 @@ class App(tk.Tk):
         self.busca = tk.StringVar()
         self.busca.trace_add("write", lambda *_: self.listar())
         self.f = escolher_fonte(self)
+        self.fonte_chip = tkfont.Font(root=self, family=self.f, size=10)
+        self.fonte_chip_b = tkfont.Font(root=self, family=self.f, size=10, weight="bold")
         self.largura_texto = 560
         self._toast_id = None
         self._ultima_copia = 0.0
@@ -1148,6 +1585,7 @@ class App(tk.Tk):
         self.cache = {}
         self.chip_labels = {}
         self.pin_btn = None
+        self.ph = None
 
         # barra lateral (recolhimento automático)
         self.recolhido = False
@@ -1155,7 +1593,14 @@ class App(tk.Tk):
         self.geo_salva = None
         self._foco_id = None
         self._aba_pronta = False
+        self.menu_aberto = None       # menu de três pontos aberto (ou None)
+        self.menu_card = None
+        self._menu_t = 0.0
+        self._menu_ignorar_clique = False
+        self._tinha_foco = False      # o app já recebeu foco desde que foi aberto/expandido?
+        self._sem_foco_cont = 0
 
+        precarregar_monitores()
         self.construir()
         self.posicionar()
         self.aplicar_fixar()
@@ -1163,11 +1608,14 @@ class App(tk.Tk):
         self.bind_all("<Button-4>", lambda e: self.rolar(-3))
         self.bind_all("<Button-5>", lambda e: self.rolar(3))
         self.bind_all("<MouseWheel>", lambda e: self.rolar(-1 if e.delta > 0 else 1))
+        self.bind_all("<Button-1>", self._clique_global, add="+")
+        self.bind("<Escape>", lambda e: self.fechar_menu())
         self.bind_all("<B1-Motion>", self.movendo_arrasto)
         self.bind_all("<ButtonRelease-1>", self.soltar_arrasto)
         self.bind("<Control-n>", lambda e: self.adicionar())
         self.bind("<Control-f>", lambda e: self.entrada.focus_set())
         self.bind("<FocusOut>", self._ao_perder_foco)
+        self.after(200, self._vigiar_foco)
 
     def _icone_janela(self):
         """Ícone da janela/barra de tarefas (opcional: só se o arquivo existir)."""
@@ -1198,9 +1646,11 @@ class App(tk.Tk):
             return
         c = self.c
         if self.fixado:
-            self.pin_btn.configurar("cadeado", c["acento"], c["acento_txt"], c["acento_hover"])
+            self.pin_btn.configurar("cadeado", c["acento"], c["acento_txt"], c["acento_hover"],
+                                    borda=c["acento"])
         else:
-            self.pin_btn.configurar("aberto", c["chip"], c["texto"], c["borda"])
+            self.pin_btn.configurar("aberto", c["card"], c["texto"], c["chip"],
+                                    borda=c["borda"])
 
     def alternar_fixar(self):
         self.fixado = not self.fixado
@@ -1215,6 +1665,10 @@ class App(tk.Tk):
             volta="clique para copiar")
 
     # ---------- barra lateral (recolher / expandir) ----------
+    def _dbg(self, msg):
+        if DEBUG:
+            print("[%8.3f] %s" % (time.monotonic() % 10000, msg), file=sys.stderr, flush=True)
+
     def _ponteiro_na_janela(self):
         """True se o mouse está sobre a janela, incluindo barra de título e bordas."""
         try:
@@ -1231,6 +1685,7 @@ class App(tk.Tk):
 
     def _ao_perder_foco(self, e=None):
         """Agenda uma checagem: o foco saiu do app de verdade?"""
+        self._dbg("FocusOut em %s" % (getattr(e, "widget", None),))
         if not RECOLHER_AUTOMATICO or self.fixado or self.recolhido:
             return
         if self._foco_id:
@@ -1240,25 +1695,70 @@ class App(tk.Tk):
     def _checar_foco(self):
         self._foco_id = None
         if self.fixado or self.recolhido or self.drag_window:
+            self._dbg("checar_foco: ignorado (fixado=%s recolhido=%s arrastando=%s)"
+                      % (self.fixado, self.recolhido, bool(self.drag_window)))
             return
         try:
             if self.state() != "normal":
+                self._dbg("checar_foco: janela não está 'normal' (%s)" % self.state())
                 return
             # Algum widget do app (inclusive diálogos) tem foco: não recolhe
-            if self.focus_displayof() is not None:
+            foco = self.focus_displayof()
+            if foco is not None:
+                self._dbg("checar_foco: app ainda tem foco em %s" % foco)
                 return
             # Sem foco, mas o mouse está sobre a janela (ex.: arrastando pela
             # barra de título): espera e confere de novo
             if self._ponteiro_na_janela():
+                self._dbg("checar_foco: mouse sobre a janela, tenta de novo em 500 ms")
                 self._foco_id = self.after(500, self._checar_foco)
                 return
+            self._dbg("checar_foco: recolhendo")
             self.recolher()
+        except (tk.TclError, KeyError):
+            pass
+
+    def _vigiar_foco(self):
+        """Confere o foco a cada 200 ms. O evento FocusOut pode atrasar ou nem chegar
+        (clicar na barra de tarefas, painéis, apps Wayland...), então isto garante que
+        a barra lateral aparece logo depois que o app perde o foco."""
+        try:
+            self.after(200, self._vigiar_foco)
+        except tk.TclError:
+            return
+        if self.menu_aberto is not None and time.monotonic() - self._menu_t > 0.4:
+            try:
+                if self.focus_displayof() is None:
+                    self.fechar_menu()
+            except (tk.TclError, KeyError):
+                pass
+        if not RECOLHER_AUTOMATICO or self.fixado or self.recolhido or self.drag_window:
+            self._sem_foco_cont = 0
+            return
+        try:
+            if self.state() != "normal":
+                return
+            if self.focus_displayof() is not None:
+                self._tinha_foco = True
+                self._sem_foco_cont = 0
+                return
+            if not self._tinha_foco or self._ponteiro_na_janela():
+                self._sem_foco_cont = 0
+                return
+            self._sem_foco_cont += 1
+            if self._sem_foco_cont >= 2:          # 2 checagens seguidas = ~0,4 s
+                self._sem_foco_cont = 0
+                self._dbg("vigia: sem foco e mouse fora, recolhendo")
+                self.recolher()
         except (tk.TclError, KeyError):
             pass
 
     def recolher(self):
         if self.recolhido or self.fixado:
             return
+        self._tinha_foco = False
+        self._sem_foco_cont = 0
+        self.fechar_menu()
         self.update_idletasks()
         self.geo_salva = self.geometry()
         larg, alt = self.winfo_width(), self.winfo_height()
@@ -1321,6 +1821,8 @@ class App(tk.Tk):
         if not self.recolhido:
             return
         self.recolhido = False
+        self._tinha_foco = False
+        self._sem_foco_cont = 0
         if self.aba:
             try:
                 self.aba.destroy()
@@ -1345,56 +1847,69 @@ class App(tk.Tk):
         self.geometry(f"{larg}x{alt}+{x}+{max(y, 0)}")
 
     def construir(self):
+        self.menu_aberto = self.menu_card = None
         for w in self.winfo_children():
             w.destroy()
         self.cache = {}
         self.cartoes_widgets = []
         self.chip_labels = {}
+        self.ph = None
         c = dict(TEMAS[self.tema])
         cor_salva = self.cfg.get("cor_personalizada")
         if cor_salva:
             c.update(derivar_acento(cor_salva, self.tema))
+        # cores derivadas (hover dos cartões e brilho do chip ativo)
+        c["card_hover"] = misturar(c["card"], c["texto"], 0.08)
+        c["borda_hover"] = misturar(c["borda"], c["suave"], 0.55)
+        c["halo"] = misturar(c["bg"], c["acento"], 0.30)
         self.c = c
         f = self.f
         self.configure(bg=c["bg"])
 
         # Cabeçalho: [título] ............ [+ Nova] [cadeado] [tema] [engrenagem]
         topo = tk.Frame(self, bg=c["bg"])
-        topo.pack(fill="x", padx=14, pady=(14, 8))
+        topo.pack(fill="x", padx=14, pady=(14, 10))
         tk.Label(topo, text="Frases Prontas", bg=c["bg"], fg=c["texto"],
                  font=(f, 15, "bold")).pack(side="left")
 
-        # Botão de Configurações (Engrenagem)
-        IconeBotao(topo, "engrenagem", self.abrir_configuracoes,
-                   c["chip"], c["texto"], c["borda"]).pack(side="right", padx=(8, 0))
+        def icone_cab(tipo, comando):
+            return IconeBotao(topo, tipo, comando, c["card"], c["texto"], c["chip"],
+                              tam=17, px=5, py=5, borda=c["borda"], bg_pai=c["bg"])
 
         # (ordem de empacotamento com side="right": o primeiro fica mais à direita)
-        IconeBotao(topo, "lua" if self.tema == "claro" else "sol", self.alternar_tema,
-                   c["chip"], c["texto"], c["borda"]).pack(side="right", padx=(8, 0))
+        icone_cab("engrenagem", self.abrir_configuracoes).pack(side="right", padx=(6, 0))
+        icone_cab("lua" if self.tema == "claro" else "sol",
+                  self.alternar_tema).pack(side="right", padx=(6, 0))
 
         # Cadeado (liga/desliga fixar)
-        self.pin_btn = IconeBotao(topo, "aberto", self.alternar_fixar,
-                                  c["chip"], c["texto"], c["borda"])
-        self.pin_btn.pack(side="right", padx=(8, 0))
+        self.pin_btn = icone_cab("aberto", self.alternar_fixar)
+        self.pin_btn.pack(side="right", padx=(6, 0))
         self.atualizar_pin()
 
-        botao(topo, "+ Nova", self.adicionar, c["acento"], c["acento_txt"],
-              c["acento_hover"], f, True, 12, 5).pack(side="right")
+        BotaoArredondado(topo, "+ Nova", self.adicionar, c["acento"], c["acento_txt"],
+                         c["acento_hover"], f, c["bg"], negrito=True,
+                         px=9, py=6, raio=8).pack(side="right", padx=(8, 0))
 
-        # Busca
-        mb = moldura(self, c)
+        # Busca (com lupa à direita e texto de dica)
+        mb = Arredondado(self, c["bg"], c["card"], c["borda"], raio=9, pad=4)
         mb.pack(fill="x", padx=14)
-        tk.Label(mb, text="Buscar", bg=c["card"], fg=c["suave"], font=(f, 10)).pack(side="left", padx=(12, 6))
-        self.entrada = tk.Entry(mb, textvariable=self.busca, relief="flat", bd=0, bg=c["card"],
-                                fg=c["texto"], insertbackground=c["texto"], font=(f, 11),
-                                highlightthickness=0)
-        self.entrada.pack(side="left", fill="x", expand=True, pady=7, padx=(0, 10))
-        self.entrada.bind("<FocusIn>", lambda e: mb.config(highlightbackground=c["acento"], highlightcolor=c["acento"]))
-        self.entrada.bind("<FocusOut>", lambda e: mb.config(highlightbackground=c["borda"], highlightcolor=c["borda"]))
+        lupa = IconeBotao(mb.interno, "lupa", lambda: self.entrada.focus_set(),
+                          c["card"], c["suave"], c["card"], tam=16, px=3, py=3,
+                          cursor="xterm")
+        lupa.pack(side="right", padx=(0, 8))
+        self.entrada = tk.Entry(mb.interno, textvariable=self.busca, relief="flat", bd=0,
+                                bg=c["card"], fg=c["texto"], insertbackground=c["texto"],
+                                font=(f, 11), highlightthickness=0)
+        self.entrada.pack(side="left", fill="x", expand=True, pady=6, padx=(10, 4))
+        self.ph = tk.Label(mb.interno, text="Buscar", bg=c["card"], fg=c["suave"],
+                           font=(f, 11), cursor="xterm")
+        self.ph.bind("<Button-1>", lambda e: self.entrada.focus_set())
+        self.entrada.bind("<FocusIn>", lambda e: mb.definir(borda=c["acento"]))
+        self.entrada.bind("<FocusOut>", lambda e: mb.definir(borda=c["borda"]))
 
         # Categorias
         self.chips = tk.Frame(self, bg=c["bg"])
-        self.chips.pack(fill="x", padx=14, pady=(10, 4))
+        self.chips.pack(fill="x", padx=14, pady=(8, 2))
         self.desenhar_chips()
 
         # Rodapé
@@ -1405,9 +1920,8 @@ class App(tk.Tk):
         area = tk.Frame(self, bg=c["bg"])
         area.pack(fill="both", expand=True, padx=(14, 6))
         self.canvas = tk.Canvas(area, bg=c["bg"], highlightthickness=0, bd=0)
-        sb = tk.Scrollbar(area, orient="vertical", command=self.canvas.yview, width=8, bd=0,
-                          relief="flat", troughcolor=c["bg"], bg=c["borda"],
-                          activebackground=c["suave"], highlightthickness=0)
+        sb = BarraRolagem(area, self.canvas.yview, c["bg"],
+                          misturar(c["borda"], c["suave"], 0.35), c["suave"])
         self.canvas.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         self.canvas.pack(side="left", fill="both", expand=True)
@@ -1425,13 +1939,9 @@ class App(tk.Tk):
     def ao_redimensionar(self, e):
         self.canvas.itemconfig(self.janela, width=e.width)
         self.largura_texto = max(200, e.width - 120)
-        for cw in self.cache.values():
-            try:
-                cw.txt.config(wraplength=self.largura_texto)
-            except tk.TclError:
-                pass
 
     def rolar(self, n):
+        self.fechar_menu()
         try:
             if self.lista.winfo_height() > self.canvas.winfo_height():
                 self.canvas.yview_scroll(n, "units")
@@ -1439,7 +1949,6 @@ class App(tk.Tk):
             pass
 
     def desenhar_chips(self):
-        c = self.c
         cats = ["Todas"] + self.categorias()
         if self.categoria not in cats:
             self.categoria = "Todas"
@@ -1449,17 +1958,13 @@ class App(tk.Tk):
                 w.destroy()
             self.chip_labels = {}
             for nome in cats:
-                l = tk.Label(self.chips, text=nome, cursor="hand2", padx=10, pady=3,
-                             font=(self.f, 10))
-                l.pack(side="left", padx=(0, 6))
-                l.bind("<Button-1>", lambda e, n=nome: self.escolher_categoria(n))
-                self.chip_labels[nome] = l
+                ch = Chip(self.chips, nome, self.fonte_chip, self.fonte_chip_b, self.c,
+                          lambda n=nome: self.escolher_categoria(n))
+                ch.pack(side="left", padx=(0, 2))
+                self.chip_labels[nome] = ch
 
-        for nome, l in self.chip_labels.items():
-            ativo = nome == self.categoria
-            l.config(bg=c["acento"] if ativo else c["chip"],
-                     fg=c["acento_txt"] if ativo else c["texto"],
-                     font=(self.f, 10, "bold" if ativo else "normal"))
+        for nome, ch in self.chip_labels.items():
+            ch.definir(nome == self.categoria)
 
     def escolher_categoria(self, nome):
         if nome == self.categoria:
@@ -1469,14 +1974,31 @@ class App(tk.Tk):
         self.listar()
 
     def resetar_destaques(self):
-        c = self.c
         for cw in self.cache.values():
             try:
-                cw.config(highlightbackground=c["borda"], highlightcolor=c["borda"])
+                cw.hover = False
+                cw.borda_forcada = None
+                cw.atualizar()
             except tk.TclError:
                 pass
 
+    def _atualizar_placeholder(self):
+        """Mostra o texto 'Buscar' só enquanto o campo estiver vazio."""
+        if self.ph is None:
+            return
+        try:
+            if self.busca.get():
+                self.ph.place_forget()
+            else:
+                self.ph.place(in_=self.entrada, x=1, rely=0.5, anchor="w")
+                self.ph.lift()
+        except tk.TclError:
+            pass
+
     def listar(self):
+        self.fechar_menu()
+        self._atualizar_placeholder()
+
         vivos = {id(d) for d in self.dados}
         for k in list(self.cache.keys()):
             if k not in vivos:
@@ -1510,53 +2032,53 @@ class App(tk.Tk):
         self.mostrar_rodape(f"{total} frase{'s' if total != 1 else ''}  ·  clique para copiar")
 
     def cartao(self, d):
-        c, f = self.c, self.f
-        card = tk.Frame(self.lista, bg=c["card"], highlightthickness=1,
-                        highlightbackground=c["borda"], highlightcolor=c["borda"], cursor="hand2")
-        card.data_index = -1
-        card.d = d
-
-        grip = IconeBotao(card, "grip", lambda d=d: self.iniciar_arrasto(d),
-                          c["card"], c["suave"], c["card"], tam=14, px=5, py=4, cursor="fleur")
-        grip.pack(side="left", padx=(4, 0), pady=5)
-
-        corpo = tk.Frame(card, bg=c["card"], cursor="hand2")
-        corpo.pack(side="left", fill="both", expand=True, padx=4, pady=9)
-        cat = tk.Label(corpo, text=d["categoria"].upper(), bg=c["card"], fg=c["acento"],
-                       font=(f, 8, "bold"), anchor="w", cursor="hand2")
-        cat.pack(fill="x")
-        txt = tk.Label(corpo, text=d["texto"], bg=c["card"], fg=c["texto"], font=(f, 11),
-                       justify="left", anchor="w", wraplength=self.largura_texto, cursor="hand2")
-        txt.pack(fill="x", pady=(3, 0))
-        card.txt = txt
-
-        acoes = tk.Frame(card, bg=c["card"])
-        acoes.pack(side="right", padx=(4, 8), pady=2)
-
-        for texto, cor, fn in (("Editar", c["acento"], lambda: self.editar(self._indice(card.d))),
-                               ("Excluir", c["perigo"], lambda: self.excluir(self._indice(card.d)))):
-            b = tk.Label(acoes, text=texto, bg=c["card"], fg=cor,
-                         font=(f, 9), cursor="hand2", padx=3, pady=3)
-            b.pack(side="top", anchor="e", pady=1)
-            b.bind("<Enter>", lambda e, b=b, cor=cor: b.config(fg=cor, font=(f, 9, "bold")))
-            b.bind("<Leave>", lambda e, b=b, cor=cor: b.config(fg=cor, font=(f, 9)))
-            b.bind("<Button-1>", lambda e, fn=fn: fn())
-
-        def entrar(e):
-            card.config(highlightbackground=c["acento"], highlightcolor=c["acento"])
-
-        def sair(e):
-            x, y = card.winfo_pointerxy()
-            w = card.winfo_containing(x, y)
-            if w is None or not e_descendente(w, card):
-                card.config(highlightbackground=c["borda"], highlightcolor=c["borda"])
-
-        for w in (card, corpo, cat, txt):
-            w.bind("<Enter>", entrar)
-            w.bind("<Leave>", sair)
-            w.bind("<Button-1>", lambda e, d=d, cat=cat, card=card, orig=d["categoria"].upper():
-                   self.copiar(self._indice(d), cat, card, orig))
+        card = CartaoFrase(
+            self.lista, self.c, d, self.f, self.largura_texto + 75,
+            ao_copiar=lambda: self.copiar(self._indice(card.d), card, card.d["categoria"].upper()),
+            ao_arrastar=lambda: self.iniciar_arrasto(card.d),
+            ao_menu=lambda: self.abrir_menu(card))
         return card
+
+    # ---------- menu de três pontos (Editar / Excluir) ----------
+    def abrir_menu(self, card):
+        mesmo = self.menu_aberto is not None and self.menu_card is card
+        self.fechar_menu()
+        if mesmo:                                  # clicar de novo nos pontos fecha
+            return
+        c = self.c
+        itens = [("Editar", c["texto"], lambda: self.editar(self._indice(card.d))),
+                 ("Excluir", c["perigo"], lambda: self.excluir(self._indice(card.d)))]
+        x, y, alt = card.posicao_menu()
+        self.menu_aberto = MenuPopup(self, c, self.f, itens, x, y, alt, self._escolher_menu)
+        self.menu_card = card
+        self._menu_t = time.monotonic()
+        self._menu_ignorar_clique = True           # o clique que abriu não deve fechar
+
+    def _escolher_menu(self, comando):
+        self.fechar_menu()
+        self.after(1, comando)
+
+    def fechar_menu(self):
+        m, self.menu_aberto, self.menu_card = self.menu_aberto, None, None
+        if m is not None:
+            try:
+                m.destroy()
+            except tk.TclError:
+                pass
+
+    def _clique_global(self, e):
+        """Clique em qualquer lugar fora do menu aberto fecha o menu."""
+        if self.menu_aberto is None:
+            return
+        if self._menu_ignorar_clique:
+            self._menu_ignorar_clique = False
+            return
+        try:
+            dentro = e_descendente(e.widget, self.menu_aberto)
+        except AttributeError:
+            dentro = False
+        if not dentro:
+            self.fechar_menu()
 
     def mostrar_rodape(self, msg, cor=None, volta=None):
         self.rodape.config(text=msg, fg=cor or self.c["suave"])
@@ -1758,31 +2280,14 @@ class App(tk.Tk):
             return
         c = self.c
         card.tremendo = True
-
-        def todos(w):
-            yield w
-            for filho in w.winfo_children():
-                yield from todos(filho)
-
-        borda_antes = (card.cget("highlightbackground"), card.cget("highlightcolor"))
-        widgets = list(todos(card))
         desloc = [8, 0, 8, 0, 6, 0, 4, 0, 2, 0]
-
-        def pintar(cor_fundo, cor_borda):
-            for w in widgets:
-                try:
-                    w.config(bg=cor_fundo)
-                except tk.TclError:
-                    pass
-            try:
-                card.config(highlightbackground=cor_borda, highlightcolor=cor_borda)
-            except tk.TclError:
-                pass
 
         def passo(i=0):
             try:
                 if i >= len(desloc):
-                    pintar(c["card"], borda_antes[0])
+                    card.fundo_forcado = None
+                    card.borda_forcada = None
+                    card.atualizar()
                     if card.winfo_manager() == "pack":
                         card.pack_configure(padx=(0, 8))
                     card.tremendo = False
@@ -1790,17 +2295,16 @@ class App(tk.Tk):
                 l = desloc[i]
                 if card.winfo_manager() == "pack":
                     card.pack_configure(padx=(l, 8 - l))
-                if (i // 2) % 2 == 0 and i < 8:
-                    pintar(c["alerta"], c["perigo"])
-                else:
-                    pintar(c["card"], c["perigo"] if i < 8 else borda_antes[0])
+                card.fundo_forcado = c["alerta"] if ((i // 2) % 2 == 0 and i < 8) else None
+                card.borda_forcada = c["perigo"] if i < 8 else None
+                card.atualizar()
                 self.after(35, passo, i + 1)
             except tk.TclError:
                 card.tremendo = False
 
         passo()
 
-    def copiar(self, i, cat_lbl, card, original):
+    def copiar(self, i, card, original):
         c = self.c
         if i < 0:
             return
@@ -1820,13 +2324,15 @@ class App(tk.Tk):
             return
 
         self._ultima_copia = time.monotonic()
-        cat_lbl.config(text="COPIADO", fg=c["ok"])
-        card.config(highlightbackground=c["ok"], highlightcolor=c["ok"])
+        card.set_categoria("COPIADO", c["ok"])
+        card.borda_forcada = c["ok"]
+        card.atualizar()
 
         def restaurar():
             try:
-                cat_lbl.config(text=original, fg=c["acento"])
-                card.config(highlightbackground=c["borda"], highlightcolor=c["borda"])
+                card.set_categoria(original, c["acento"])
+                card.borda_forcada = None
+                card.atualizar()
             except tk.TclError:
                 pass
 
