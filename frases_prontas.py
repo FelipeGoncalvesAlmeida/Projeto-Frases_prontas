@@ -58,7 +58,8 @@ TEMAS = {
 # Tamanho e posição da janela principal
 LARGURA, ALTURA = 360, 520
 MARGEM = 12
-CANTO = "inferior-direito"    # opções: inferior-direito, inferior-esquerdo, superior-direito, superior-esquerdo
+CANTO = "meio-direito"        # opções: meio-direito, meio-esquerdo, inferior-direito, inferior-esquerdo,
+                              #         superior-direito, superior-esquerdo
 
 # Clipboard (Linux): True = usa xclip/wl-copy quando existirem (o texto sobrevive ao fechar o app)
 #                    False = usa só o clipboard do Tkinter (o texto some ao fechar o app)
@@ -69,6 +70,8 @@ INTERVALO_COPIA = 1.5
 
 # Barra lateral (quando o app não está fixado e perde o foco)
 RECOLHER_AUTOMATICO = True    # False = nunca recolhe
+INTERVALO_VIGIA = 50          # ms entre checagens do foco (menor = recolhe mais rápido)
+ESPERA_FOCUS_OUT = 60         # ms de espera após o evento FocusOut antes de confirmar
 LARGURA_ABA = 12              # largura da barra, em pixels
 ALTURA_ABA = 120              # altura da barra, em pixels
 
@@ -862,15 +865,34 @@ def e_descendente(w, ancestral):
     return False
 
 
+def posicionar_sobre(janela, pai, w, h):
+    """Centraliza um diálogo (de tamanho w x h) sobre 'pai', sem sair do monitor.
+    Só mexe na POSIÇÃO; o tamanho continua o que o diálogo já definiu."""
+    try:
+        pai.update_idletasks()
+        px, py = pai.winfo_rootx(), pai.winfo_rooty()
+        pw, ph = pai.winfo_width(), pai.winfo_height()
+        if pw < 50 or ph < 50:
+            return
+        mx, my, mw, mh = monitor_do_ponto(listar_monitores(janela), px + pw / 2, py + ph / 2)
+        x = max(mx, min(px + (pw - w) // 2, mx + mw - w))
+        y = max(my, min(py + (ph - h) // 2, my + mh - h))
+        janela.geometry(f"+{int(x)}+{int(y)}")
+    except Exception:
+        pass
+
+
 class Dialogo(tk.Toplevel):
     def __init__(self, pai, c, fonte, categorias, frase=None):
         super().__init__(pai, bg=c["bg"])
+        self.withdraw()          # fica escondida até estar pronta e posicionada
         self.c, self.f = c, fonte
         self.resultado = None
         self.title("Editar frase" if frase else "Nova frase")
         self.geometry("360x400")
         self.minsize(320, 340)
         self.transient(pai)
+        posicionar_sobre(self, pai, 360, 400)
 
         corpo = tk.Frame(self, bg=c["bg"])
         corpo.pack(fill="both", expand=True, padx=16, pady=14)
@@ -925,6 +947,7 @@ class Dialogo(tk.Toplevel):
         self.bind("<Escape>", lambda e: self.destroy())
         self.bind("<Control-Return>", lambda e: self.ok())
         self.texto.focus_set()
+        self.deiconify()
         try:
             self.wait_visibility()
             self.grab_set()
@@ -944,12 +967,14 @@ class Dialogo(tk.Toplevel):
 class ConfirmarDialogo(tk.Toplevel):
     def __init__(self, pai, c, fonte, titulo, mensagem):
         super().__init__(pai, bg=c["bg"])
+        self.withdraw()          # fica escondida até estar pronta e posicionada
         self.c, self.f = c, fonte
         self.resultado = False
         self.title(titulo)
         self.geometry("325x150")
         self.minsize(300, 140)
         self.transient(pai)
+        posicionar_sobre(self, pai, 325, 150)
 
         corpo = tk.Frame(self, bg=c["bg"])
         corpo.pack(fill="both", expand=True, padx=16, pady=16)
@@ -970,6 +995,7 @@ class ConfirmarDialogo(tk.Toplevel):
 
         self.bind("<Escape>", lambda e: self.destroy())
         self.bind("<Return>", lambda e: self.ok())
+        self.deiconify()
         try:
             self.wait_visibility()
             self.grab_set()
@@ -1363,36 +1389,36 @@ class DialogoCor(tk.Toplevel):
 
     def __init__(self, pai, c, fonte, cor_atual, tema="claro", ao_mudar=None):
         super().__init__(pai, bg=c["bg"])
+        self.withdraw()          # fica escondida até estar pronta e posicionada
         self.c, self.f, self.tema = c, fonte, tema
         self.ao_mudar = ao_mudar
         self.resultado = None
         self.title("Cor do tema")
-        self.geometry("340x600")
         self.resizable(False, False)
         self.transient(pai)
 
         corpo = tk.Frame(self, bg=c["bg"])
-        corpo.pack(fill="both", expand=True, padx=16, pady=14)
+        corpo.pack(fill="both", expand=True, padx=16, pady=12)
 
         tk.Label(corpo, text="Cor do tema", bg=c["bg"], fg=c["texto"],
                  font=(fonte, 13, "bold")).pack(anchor="w")
         tk.Label(corpo, text="Clique e arraste na roda. A barra ajusta o brilho.",
-                 bg=c["bg"], fg=c["suave"], font=(fonte, 9)).pack(anchor="w", pady=(2, 10))
+                 bg=c["bg"], fg=c["suave"], font=(fonte, 9)).pack(anchor="w", pady=(2, 8))
 
         self.seletor = SeletorCor(corpo, bg=c["bg"], card=c["card"], fg=c["texto"],
                                   suave=c["suave"], borda=c["borda"], acento=c["acento"],
-                                  fonte=fonte, cor_inicial=cor_atual, tamanho=220,
+                                  fonte=fonte, cor_inicial=cor_atual, tamanho=168,
                                   comando=self._previa)
         self.seletor.pack()
 
         # Prévia em tempo real
         tk.Label(corpo, text="Prévia", bg=c["bg"], fg=c["suave"],
-                 font=(fonte, 9, "bold")).pack(anchor="w", pady=(14, 4))
+                 font=(fonte, 9, "bold")).pack(anchor="w", pady=(10, 3))
         prev = tk.Frame(corpo, bg=c["card"], highlightthickness=1,
                         highlightbackground=c["borda"])
         prev.pack(fill="x")
         interno = tk.Frame(prev, bg=c["card"])
-        interno.pack(fill="x", padx=10, pady=8)
+        interno.pack(fill="x", padx=10, pady=6)
         self.prev_cat = tk.Label(interno, text="CATEGORIA", bg=c["card"], fg=c["acento"],
                                  font=(fonte, 8, "bold"))
         self.prev_cat.pack(side="left")
@@ -1402,7 +1428,7 @@ class DialogoCor(tk.Toplevel):
         self._pintar_previa(self.seletor.get_hex())
 
         rodape = tk.Frame(corpo, bg=c["bg"])
-        rodape.pack(fill="x", side="bottom")
+        rodape.pack(fill="x", side="bottom", pady=(12, 0))
         _botao(rodape, "Aplicar", self.ok, c["acento"], c["acento_txt"], c["acento_hover"],
                fonte, True, 18, 8).pack(side="right")
         _botao(rodape, "Cancelar", self.destroy, c["chip"], c["texto"], c["borda"],
@@ -1411,6 +1437,11 @@ class DialogoCor(tk.Toplevel):
                fonte, False, 14, 8).pack(side="left")
 
         self.bind("<Escape>", lambda e: self.destroy())
+        self.update_idletasks()
+        w, h = max(self.winfo_reqwidth(), 300), self.winfo_reqheight()
+        self.geometry(f"{w}x{h}")
+        posicionar_sobre(self, pai, w, h)
+        self.deiconify()
         try:
             self.wait_visibility()
             self.grab_set()
@@ -1443,11 +1474,13 @@ class DialogoConfiguracoes(tk.Toplevel):
 
     def __init__(self, pai, c, fonte, tema):
         super().__init__(pai, bg=c["bg"])
+        self.withdraw()          # fica escondida até estar pronta e posicionada
         self.c, self.f, self.tema = c, fonte, tema
         self.title("Configurações")
         self.geometry("345x325")
         self.resizable(False, False)
         self.transient(pai)
+        posicionar_sobre(self, pai, 345, 325)
 
         corpo = tk.Frame(self, bg=c["bg"])
         corpo.pack(fill="both", expand=True, padx=16, pady=16)
@@ -1508,6 +1541,7 @@ class DialogoConfiguracoes(tk.Toplevel):
                fonte, False, 16, 7).pack(side="right")
 
         self.bind("<Escape>", lambda e: self.destroy())
+        self.deiconify()
         try:
             self.wait_visibility()
             self.grab_set()
@@ -1599,6 +1633,7 @@ class App(tk.Tk):
         self._menu_ignorar_clique = False
         self._tinha_foco = False      # o app já recebeu foco desde que foi aberto/expandido?
         self._sem_foco_cont = 0
+        self._expandido_em = None     # quando a barra lateral foi expandida pela última vez
 
         precarregar_monitores()
         self.construir()
@@ -1615,7 +1650,7 @@ class App(tk.Tk):
         self.bind("<Control-n>", lambda e: self.adicionar())
         self.bind("<Control-f>", lambda e: self.entrada.focus_set())
         self.bind("<FocusOut>", self._ao_perder_foco)
-        self.after(200, self._vigiar_foco)
+        self.after(INTERVALO_VIGIA, self._vigiar_foco)
 
     def _icone_janela(self):
         """Ícone da janela/barra de tarefas (opcional: só se o arquivo existir)."""
@@ -1683,6 +1718,28 @@ class App(tk.Tk):
         except tk.TclError:
             return False
 
+    def _app_tem_foco(self):
+        """True se o app está em primeiro plano. No Windows pergunta ao sistema
+        (o foco interno do Tk pode ficar 'fantasma' depois de forçar o foreground);
+        nos outros sistemas usa o foco do Tk."""
+        if WINDOWS:
+            try:
+                import ctypes
+                from ctypes import wintypes
+                u32 = ctypes.windll.user32
+                fg = u32.GetForegroundWindow()
+                if not fg:
+                    return False
+                pid = wintypes.DWORD(0)
+                u32.GetWindowThreadProcessId(fg, ctypes.byref(pid))
+                return pid.value == os.getpid()
+            except Exception:
+                pass
+        try:
+            return self.focus_displayof() is not None
+        except (tk.TclError, KeyError):
+            return False
+
     def _ao_perder_foco(self, e=None):
         """Agenda uma checagem: o foco saiu do app de verdade?"""
         self._dbg("FocusOut em %s" % (getattr(e, "widget", None),))
@@ -1690,7 +1747,7 @@ class App(tk.Tk):
             return
         if self._foco_id:
             self.after_cancel(self._foco_id)
-        self._foco_id = self.after(250, self._checar_foco)
+        self._foco_id = self.after(ESPERA_FOCUS_OUT, self._checar_foco)
 
     def _checar_foco(self):
         self._foco_id = None
@@ -1703,15 +1760,14 @@ class App(tk.Tk):
                 self._dbg("checar_foco: janela não está 'normal' (%s)" % self.state())
                 return
             # Algum widget do app (inclusive diálogos) tem foco: não recolhe
-            foco = self.focus_displayof()
-            if foco is not None:
-                self._dbg("checar_foco: app ainda tem foco em %s" % foco)
+            if self._app_tem_foco():
+                self._dbg("checar_foco: app ainda tem foco")
                 return
             # Sem foco, mas o mouse está sobre a janela (ex.: arrastando pela
             # barra de título): espera e confere de novo
             if self._ponteiro_na_janela():
                 self._dbg("checar_foco: mouse sobre a janela, tenta de novo em 500 ms")
-                self._foco_id = self.after(500, self._checar_foco)
+                self._foco_id = self.after(150, self._checar_foco)
                 return
             self._dbg("checar_foco: recolhendo")
             self.recolher()
@@ -1723,38 +1779,70 @@ class App(tk.Tk):
         (clicar na barra de tarefas, painéis, apps Wayland...), então isto garante que
         a barra lateral aparece logo depois que o app perde o foco."""
         try:
-            self.after(200, self._vigiar_foco)
+            self.after(INTERVALO_VIGIA, self._vigiar_foco)
         except tk.TclError:
             return
         if self.menu_aberto is not None and time.monotonic() - self._menu_t > 0.4:
             try:
-                if self.focus_displayof() is None:
+                if not self._app_tem_foco():
                     self.fechar_menu()
             except (tk.TclError, KeyError):
                 pass
+        if DEBUG:
+            try:
+                estado = (self.recolhido, self.fixado, bool(self.drag_window),
+                          self.state(), self._app_tem_foco(),
+                          self._tinha_foco, self._ponteiro_na_janela(),
+                          self.menu_aberto is not None)
+            except (tk.TclError, KeyError):
+                estado = None
+            if estado != getattr(self, "_dbg_estado", None):
+                self._dbg_estado = estado
+                self._dbg("estado: recolhido=%s fixado=%s arrastando=%s state=%s "
+                          "tem_foco=%s tinha_foco=%s mouse_na_janela=%s menu=%s"
+                          % (estado or ("?",) * 8))
         if not RECOLHER_AUTOMATICO or self.fixado or self.recolhido or self.drag_window:
             self._sem_foco_cont = 0
             return
         try:
             if self.state() != "normal":
                 return
-            if self.focus_displayof() is not None:
+            if self._app_tem_foco():
                 self._tinha_foco = True
                 self._sem_foco_cont = 0
                 return
-            if not self._tinha_foco or self._ponteiro_na_janela():
+            if self._ponteiro_na_janela():
                 self._sem_foco_cont = 0
                 return
+            if not self._tinha_foco:
+                # nunca recebeu foco após expandir (Windows pode negar): só recolhe
+                # se foi expandido pela barra e já passou um tempo com o mouse fora
+                if (self._expandido_em is None
+                        or time.monotonic() - self._expandido_em < 0.8):
+                    self._sem_foco_cont = 0
+                    return
             self._sem_foco_cont += 1
-            if self._sem_foco_cont >= 2:          # 2 checagens seguidas = ~0,4 s
+            if self._sem_foco_cont >= 2:          # 2 checagens seguidas = ~0,1 s
                 self._sem_foco_cont = 0
                 self._dbg("vigia: sem foco e mouse fora, recolhendo")
                 self.recolher()
         except (tk.TclError, KeyError):
             pass
 
+    def _dialogo_aberto(self):
+        """True se há uma janela modal aberta (configurações, cor, nova frase...).
+        Com um grab ativo o Tk bloqueia os eventos da barra lateral, então não dá
+        para recolher nesse momento."""
+        try:
+            return self.grab_current() is not None
+        except (tk.TclError, KeyError):
+            return False
+
     def recolher(self):
         if self.recolhido or self.fixado:
+            return
+        if self._dialogo_aberto():
+            self._dbg("recolher: ignorado (há janela modal aberta)")
             return
         self._tinha_foco = False
         self._sem_foco_cont = 0
@@ -1817,12 +1905,81 @@ class App(tk.Tk):
         aba.update_idletasks()
         aba.deiconify()
 
+    def _win_hwnd(self):
+        import ctypes
+        u32 = ctypes.windll.user32
+        return u32.GetParent(self.winfo_id()) or self.winfo_id()
+
+    def _win_topmost(self, ligado):
+        """Liga/desliga 'sempre por cima' direto no Windows (sem passar pelo cache do Tk)."""
+        import ctypes
+        u32 = ctypes.windll.user32
+        # SWP_NOSIZE|SWP_NOMOVE|SWP_NOACTIVATE = 0x0013 ; HWND_TOPMOST=-1, HWND_NOTOPMOST=-2
+        u32.SetWindowPos(self._win_hwnd(), -1 if ligado else -2, 0, 0, 0, 0, 0x0013)
+
+    def _tentar_foreground(self):
+        """Uma tentativa de assumir o foreground no Windows."""
+        import ctypes
+        u32 = ctypes.windll.user32
+        k32 = ctypes.windll.kernel32
+        hwnd = self._win_hwnd()
+        self._win_topmost(True)
+        fg = u32.GetForegroundWindow()
+        t_fg = u32.GetWindowThreadProcessId(fg, None) if fg else 0
+        t_me = k32.GetCurrentThreadId()
+        anexado = False
+        if t_fg and t_fg != t_me:
+            anexado = bool(u32.AttachThreadInput(t_fg, t_me, True))
+        try:
+            u32.ShowWindow(hwnd, 9)              # SW_RESTORE
+            u32.BringWindowToTop(hwnd)
+            u32.SetForegroundWindow(hwnd)
+            u32.SwitchToThisWindow(hwnd, True)   # ignora a trava de foreground
+        finally:
+            if anexado:
+                u32.AttachThreadInput(t_fg, t_me, False)
+        try:
+            self.focus_force()
+        except tk.TclError:
+            pass
+
+    def _trazer_para_frente(self):
+        """Traz a janela para frente. No Windows tenta 3 vezes (0, 80 e 250 ms),
+        porque a primeira tentativa pode ser negada pela trava de foreground."""
+        if getattr(self, "_soltar_id", None):
+            try:
+                self.after_cancel(self._soltar_id)
+            except (tk.TclError, ValueError):
+                pass
+            self._soltar_id = None
+
+        try:
+            self.attributes("-topmost", True)
+            self.lift()
+            self.focus_force()
+        except tk.TclError:
+            pass
+
+        if WINDOWS:
+            def tentar():
+                if self.recolhido:
+                    return
+                try:
+                    self._tentar_foreground()
+                except Exception as ex:
+                    self._dbg("foreground falhou: %r" % (ex,))
+            tentar()
+            self.after(80, tentar)
+            self.after(250, tentar)
+
     def expandir(self):
         if not self.recolhido:
             return
+        self._dbg("expandir()")
         self.recolhido = False
         self._tinha_foco = False
         self._sem_foco_cont = 0
+        self._expandido_em = time.monotonic()
         if self.aba:
             try:
                 self.aba.destroy()
@@ -1832,9 +1989,7 @@ class App(tk.Tk):
         self.deiconify()
         if self.geo_salva:
             self.geometry(self.geo_salva)
-        self.aplicar_fixar()
-        self.lift()
-        self.focus_force()
+        self._trazer_para_frente()
 
     # ---------- interface ----------
     def posicionar(self):
@@ -1843,7 +1998,12 @@ class App(tk.Tk):
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         larg, alt = min(LARGURA, sw - 2 * MARGEM), min(ALTURA, sh - 2 * MARGEM)
         x = MARGEM if "esquerdo" in CANTO else sw - larg - MARGEM
-        y = MARGEM + 30 if "superior" in CANTO else sh - alt - MARGEM - 40
+        if "meio" in CANTO:
+            y = (sh - alt) // 2
+        elif "superior" in CANTO:
+            y = MARGEM + 30
+        else:
+            y = sh - alt - MARGEM - 40
         self.geometry(f"{larg}x{alt}+{x}+{max(y, 0)}")
 
     def construir(self):
@@ -2339,8 +2499,7 @@ class App(tk.Tk):
         anterior = getattr(card, "restaurar_id", None)
         if anterior:
             self.after_cancel(anterior)
-        card.restaurar_id = self.after(1300, restaurar)
-        self.mostrar_rodape("Copiado!", c["ok"], volta="clique para copiar")
+        card.restaurar_id = self.after(800, restaurar)
 
     def adicionar(self):
         r = Dialogo(self, self.c, self.f, self.categorias()).resultado
