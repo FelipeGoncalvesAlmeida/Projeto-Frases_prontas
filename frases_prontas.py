@@ -9,6 +9,7 @@ Linux - dependências: python3 e python3-tk
 Linux - opcionais:
   xclip ou wl-clipboard  (mantém o texto copiado após fechar o app)
   xrandr                 (detecta vários monitores)
+  zenity ou kdialog      (janela de salvar/abrir arquivo igual à do navegador)
 
 Windows: só o Python oficial (já inclui o Tkinter). Nada mais a instalar.
 
@@ -17,6 +18,7 @@ na mesma pasta do script.
 """
 import json
 import colorsys
+from contextlib import contextmanager
 import math
 import os
 import re
@@ -27,7 +29,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import font as tkfont
-from tkinter import messagebox
+from tkinter import filedialog
 
 DEBUG = bool(os.environ.get("FRASES_DEBUG"))      # FRASES_DEBUG=1 mostra o que decide recolher
 
@@ -75,6 +77,9 @@ ESPERA_FOCUS_OUT = 60         # ms de espera após o evento FocusOut antes de co
 LARGURA_ABA = 12              # largura da barra, em pixels
 ALTURA_ABA = 120              # altura da barra, em pixels
 
+# Ícones do cabeçalho: espessura do traço em pixels (1 = fino/minimalista, 2 = mais marcado)
+ESPESSURA_ICONE = 1
+
 EXEMPLOS = [
     {"categoria": "Saudações", "texto": "Olá! Tudo bem? Como posso ajudar?"},
     {"categoria": "Saudações", "texto": "Obrigado pelo contato! Retorno em breve."},
@@ -119,12 +124,196 @@ def _gravar(caminho, dados):
     os.replace(tmp, caminho)
 
 
+# ---------- backup (exportar / restaurar) ----------
+BACKUP_APP = "FrasesProntas"
+BACKUP_VERSAO = 1
+# Só vai no backup o que é preferência pessoal. "Fixar" e "Iniciar com o computador"
+# dependem da máquina, então ficam de fora.
+CFG_NO_BACKUP = ("tema", "cor_personalizada", "usar_intervalo")
+
+
+def montar_backup(frases, cfg):
+    return {
+        "app": BACKUP_APP,
+        "versao": BACKUP_VERSAO,
+        "exportado_em": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "frases": frases,
+        "config": {k: cfg[k] for k in CFG_NO_BACKUP if k in cfg},
+    }
+
+
+def gravar_backup(caminho, frases, cfg):
+    """Grava o backup onde o usuário escolheu (arquivo temporário + troca, sem deixar .bak)."""
+    tmp = caminho + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(montar_backup(frases, cfg), f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, caminho)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def ler_backup(caminho):
+    """Lê e valida um backup. Devolve (frases, config). Levanta ValueError se for inválido.
+    'config' é None quando o arquivo não traz configurações (ex.: um frases.json puro)."""
+    try:
+        with open(caminho, "r", encoding="utf-8-sig") as f:
+            obj = json.load(f)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise ValueError("O arquivo não é um backup válido.")
+
+    cfg = None
+    if isinstance(obj, dict):
+        if obj.get("app") != BACKUP_APP:
+            raise ValueError("Este arquivo não é um backup do Frases Prontas.")
+        versao = obj.get("versao", 1)
+        if not isinstance(versao, int) or versao > BACKUP_VERSAO:
+            raise ValueError("Este backup foi criado por uma versão mais nova do app.\n"
+                             "Atualize o Frases Prontas e tente de novo.")
+        brutas = obj.get("frases")
+        bruto_cfg = obj.get("config")
+        cfg = {}
+        if isinstance(bruto_cfg, dict):
+            if bruto_cfg.get("tema") in TEMAS:
+                cfg["tema"] = bruto_cfg["tema"]
+            cor = hex_valido(bruto_cfg.get("cor_personalizada"))
+            if cor:
+                cfg["cor_personalizada"] = cor
+            if isinstance(bruto_cfg.get("usar_intervalo"), bool):
+                cfg["usar_intervalo"] = bruto_cfg["usar_intervalo"]
+    elif isinstance(obj, list):          # também aceita o frases.json "cru"
+        brutas = obj
+    else:
+        raise ValueError("O arquivo não é um backup válido.")
+
+    if not isinstance(brutas, list):
+        raise ValueError("O arquivo não é um backup válido.")
+    frases = []
+    for d in brutas:
+        if isinstance(d, dict) and isinstance(d.get("texto"), str) and d["texto"].strip():
+            item = dict(d)
+            cat = d.get("categoria")
+            item["categoria"] = cat.strip() if isinstance(cat, str) and cat.strip() else "Geral"
+            frases.append(item)
+    if not frases:
+        raise ValueError("O backup não contém nenhuma frase.")
+    return frases, cfg
+
+
+def mesclar_frases(atuais, novas):
+    """Junta as frases do backup às atuais, sem duplicar (mesma categoria + mesmo texto).
+    Devolve (lista_final, quantidade_adicionada)."""
+    vistas = {(d["categoria"], d["texto"]) for d in atuais}
+    final, add = list(atuais), 0
+    for d in novas:
+        chave = (d["categoria"], d["texto"])
+        if chave not in vistas:
+            vistas.add(chave)
+            final.append(d)
+            add += 1
+    return final, add
+
+
 def escolher_fonte(root):
     disponiveis = set(tkfont.families(root))
     for nome in ("Segoe UI", "Inter", "Noto Sans", "Ubuntu", "Cantarell", "Open Sans", "DejaVu Sans"):
         if nome in disponiveis:
             return nome
     return tkfont.nametofont("TkDefaultFont").actual("family")
+
+
+# ---------- iniciar com o computador ----------
+APP_ID = "FrasesProntas"
+FLAG_RECOLHIDO = "--iniciar-recolhido"      # abre já como barra lateral (usado no login)
+AUTOSTART_SUPORTADO = WINDOWS or LINUX
+_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+ARQUIVO_AUTOSTART = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config"),
+    "autostart", "frases-prontas.desktop")
+
+
+def _comando_inicio():
+    """Comando (lista) que abre o app no login: o .exe empacotado, ou python + este script."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable, FLAG_RECOLHIDO]
+    exe = sys.executable
+    if WINDOWS:                                   # pythonw não abre janela de console
+        pw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+        if os.path.exists(pw):
+            exe = pw
+    return [exe, os.path.abspath(__file__), FLAG_RECOLHIDO]
+
+
+def _exec_desktop(partes):
+    """Monta a linha Exec= de um arquivo .desktop (com aspas/escapes quando preciso)."""
+    def q(a):
+        if a and not re.search(r"[\s\"'\\<>~|&;$*?#()`%]", a):
+            return a
+        a = a.replace("%", "%%").replace("\\", "\\\\\\\\")
+        for ch in ('"', "`", "$"):
+            a = a.replace(ch, "\\" + ch)
+        return '"' + a + '"'
+    return " ".join(q(a) for a in partes)
+
+
+def autostart_ativo():
+    """True se o app está registrado para iniciar com o computador."""
+    try:
+        if WINDOWS:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as k:
+                winreg.QueryValueEx(k, APP_ID)
+            return True
+        return os.path.exists(ARQUIVO_AUTOSTART)
+    except (OSError, ImportError):
+        return False
+
+
+def definir_autostart(ligado):
+    """Liga/desliga o início automático. Devolve True se deu certo."""
+    try:
+        if WINDOWS:
+            import winreg
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as k:
+                if ligado:
+                    winreg.SetValueEx(k, APP_ID, 0, winreg.REG_SZ,
+                                      subprocess.list2cmdline(_comando_inicio()))
+                else:
+                    try:
+                        winreg.DeleteValue(k, APP_ID)
+                    except FileNotFoundError:
+                        pass
+        elif LINUX:
+            if ligado:
+                os.makedirs(os.path.dirname(ARQUIVO_AUTOSTART), exist_ok=True)
+                conteudo = ("[Desktop Entry]\n"
+                            "Type=Application\n"
+                            "Name=Frases Prontas\n"
+                            "Comment=Copie frases salvas com um clique\n"
+                            "Exec=%s\n"
+                            "Terminal=false\n"
+                            "X-GNOME-Autostart-enabled=true\n"
+                            "X-GNOME-Autostart-Delay=3\n" % _exec_desktop(_comando_inicio()))
+                tmp = ARQUIVO_AUTOSTART + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write(conteudo)
+                os.replace(tmp, ARQUIVO_AUTOSTART)
+            else:
+                try:
+                    os.remove(ARQUIVO_AUTOSTART)
+                except FileNotFoundError:
+                    pass
+        else:
+            return False
+        return True
+    except Exception:
+        return False
 
 
 # ---------- área de transferência ----------
@@ -363,42 +552,110 @@ def retangulo_arredondado(canvas, x1, y1, x2, y2, r, **kw):
     return canvas.create_polygon(pts, smooth=True, **kw)
 
 
+def _arco(cx, cy, r, a0, delta, n=22):
+    """Pontos de um arco de circunferência (a0 e delta em radianos)."""
+    return [(cx + r * math.cos(a0 + delta * i / n), cy + r * math.sin(a0 + delta * i / n))
+            for i in range(n + 1)]
+
+
+def _pontos_lua():
+    """Contorno de uma lua crescente (unidades 0..1): círculo grande menos um círculo
+    menor deslocado para o canto superior direito. Devolve lista de (x, y)."""
+    c1x, c1y, r1 = .47, .53, .41          # corpo da lua
+    c2x, c2y, r2 = .66, .37, .35          # círculo que "morde" a lua
+    d = math.hypot(c2x - c1x, c2y - c1y)
+    a = (r1 * r1 - r2 * r2 + d * d) / (2 * d)
+    h = math.sqrt(max(r1 * r1 - a * a, 0))
+    ux, uy = (c2x - c1x) / d, (c2y - c1y) / d
+    mx, my = c1x + a * ux, c1y + a * uy
+    p = (mx + h * uy, my - h * ux)        # as duas pontas da lua
+    q = (mx - h * uy, my + h * ux)
+
+    # arco externo (círculo 1) de p até q, pelo lado que NÃO está dentro do círculo 2
+    a0 = math.atan2(p[1] - c1y, p[0] - c1x)
+    a1 = math.atan2(q[1] - c1y, q[0] - c1x)
+    delta = (a1 - a0) % (2 * math.pi)
+    mid = (c1x + r1 * math.cos(a0 + delta / 2), c1y + r1 * math.sin(a0 + delta / 2))
+    if math.hypot(mid[0] - c2x, mid[1] - c2y) < r2:
+        delta -= 2 * math.pi
+    externo = _arco(c1x, c1y, r1, a0, delta)
+
+    # arco interno (círculo 2) de q de volta até p, pelo lado que está dentro do círculo 1
+    b0 = math.atan2(q[1] - c2y, q[0] - c2x)
+    b1 = math.atan2(p[1] - c2y, p[0] - c2x)
+    delta2 = (b1 - b0) % (2 * math.pi)
+    mid2 = (c2x + r2 * math.cos(b0 + delta2 / 2), c2y + r2 * math.sin(b0 + delta2 / 2))
+    if math.hypot(mid2[0] - c1x, mid2[1] - c1y) > r1:
+        delta2 -= 2 * math.pi
+    interno = _arco(c2x, c2y, r2, b0, delta2)
+    return externo + interno[1:-1]
+
+
+def _haste_cadeado(aberto):
+    """Haste (o arco de cima) do cadeado, em unidades 0..1.
+    Fechado: arco completo com as duas pernas presas ao corpo.
+    Aberto: haste levantada e solta, sem a perna da direita."""
+    cx, cy, r, n = .5, .29, .21, 24
+    esq = cx - r
+    pts = [(esq, .46), (esq, cy)]
+    giro = 168.5 if aberto else 180
+    for i in range(1, n + 1):
+        a = math.radians(180 + giro * i / n)
+        pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+    if not aberto:
+        pts.append((cx + r, .46))
+    return pts
+
+
+def _pontos_engrenagem(dentes=8, r_ponta=.46, r_base=.36, a_ponta=11, a_base=17):
+    """Contorno de uma engrenagem simétrica (unidades 0..1). Os dentes têm ponta e vale
+    em arco (não em linha reta), então o desenho fica redondo e sem 'quinas' estranhas.
+    Com 8 dentes há um dente em cima, embaixo, à esquerda, à direita e nas diagonais."""
+    passo = 360 / dentes
+    pts = []
+    for i in range(dentes):
+        c = i * passo
+        for ang, r in ((c - a_base, r_base), (c - a_ponta, r_ponta), (c, r_ponta),
+                       (c + a_ponta, r_ponta), (c + a_base, r_base),
+                       (c + passo / 2, r_base)):          # meio do vale
+            rad = math.radians(ang)
+            pts.append((.5 + r * math.cos(rad), .5 + r * math.sin(rad)))
+    return pts
+
+
 def desenhar_icone(cv, tipo, ox, oy, s, cor, bg):
-    """Desenha um ícone de contorno no canvas (idêntico em qualquer sistema).
+    """Ícones minimalistas de traço fino, idênticos em qualquer sistema.
     ox, oy = canto superior esquerdo; s = tamanho; cor = traço; bg = fundo atual."""
     def P(x, y):
         return ox + x * s, oy + y * s
 
-    w = max(2, round(s / 8))
+    w = ESPESSURA_ICONE
 
     if tipo in ("cadeado", "aberto"):
-        retangulo_arredondado(cv, *P(.18, .46), *P(.82, .92), max(1, s * .08),
+        # só contorno: a haste fechada (presa ao corpo) ou levantada e solta
+        haste = [v for x, y in _haste_cadeado(tipo == "aberto") for v in P(x, y)]
+        cv.create_line(*haste, fill=cor, width=w, capstyle="round", joinstyle="round")
+        retangulo_arredondado(cv, *P(.16, .46), *P(.84, .92), s * .09,
                               fill="", outline=cor, width=w)
-        if tipo == "cadeado":
-            cv.create_arc(*P(.3, .10), *P(.7, .62), start=0, extent=180,
-                          style="arc", outline=cor, width=w)
-            cv.create_line(*P(.3, .36), *P(.3, .48), fill=cor, width=w)
-            cv.create_line(*P(.7, .36), *P(.7, .48), fill=cor, width=w)
-        else:
-            cv.create_arc(*P(.3, .0), *P(.7, .52), start=0, extent=180,
-                          style="arc", outline=cor, width=w)
-            cv.create_line(*P(.3, .26), *P(.3, .48), fill=cor, width=w)
-        cv.create_oval(*P(.43, .62), *P(.57, .76), fill=cor, outline=cor)
 
     elif tipo == "lua":
-        cv.create_oval(*P(.15, .15), *P(.85, .85), fill=cor, outline=cor)
-        cv.create_oval(*P(.38, .04), *P(1.0, .68), fill=bg, outline=bg)
+        pts = [v for x, y in _pontos_lua() for v in P(x, y)]
+        cv.create_polygon(*pts, fill="", outline=cor, width=w, joinstyle="round")
 
     elif tipo == "sol":
-        # círculo com metade preenchida + 8 raios (estilo "contraste")
-        cv.create_oval(*P(.28, .28), *P(.72, .72), outline=cor, width=w)
-        cv.create_arc(*P(.28, .28), *P(.72, .72), start=90, extent=180,
-                      fill=cor, outline=cor)
+        cv.create_oval(*P(.30, .30), *P(.70, .70), outline=cor, width=w)
         for i in range(8):
             a = i * math.pi / 4
-            cv.create_line(*P(.5 + .35 * math.cos(a), .5 + .35 * math.sin(a)),
-                           *P(.5 + .49 * math.cos(a), .5 + .49 * math.sin(a)),
+            cv.create_line(*P(.5 + .34 * math.cos(a), .5 + .34 * math.sin(a)),
+                           *P(.5 + .46 * math.cos(a), .5 + .46 * math.sin(a)),
                            fill=cor, width=w, capstyle="round")
+
+    elif tipo == "ajustes":
+        # três linhas com um botão deslizante cada (configurações, bem minimalista)
+        for y, x in ((.24, .66), (.50, .34), (.76, .60)):
+            cv.create_line(*P(.12, y), *P(.88, y), fill=cor, width=w, capstyle="round")
+            r = .10
+            cv.create_oval(*P(x - r, y - r), *P(x + r, y + r), fill=bg, outline=cor, width=w)
 
     elif tipo == "grip":
         r = .09
@@ -407,16 +664,9 @@ def desenhar_icone(cv, tipo, ox, oy, s, cor, bg):
                 cv.create_oval(*P(cx - r, cy - r), *P(cx + r, cy + r), fill=cor, outline=cor)
 
     elif tipo == "engrenagem":
-        pts = []
-        dentes = 8
-        for i in range(dentes):
-            a = i * 2 * math.pi / dentes
-            for da, rr in ((-.30, .34), (-.17, .48), (.17, .48), (.30, .34)):
-                ang = a + da
-                pts.extend(P(.5 + rr * math.cos(ang), .5 + rr * math.sin(ang)))
-        fino = max(1, w - 1)
-        cv.create_polygon(*pts, fill="", outline=cor, width=fino, joinstyle="round")
-        cv.create_oval(*P(.37, .37), *P(.63, .63), outline=cor, width=fino)
+        pts = [v for x, y in _pontos_engrenagem() for v in P(x, y)]
+        cv.create_polygon(*pts, fill="", outline=cor, width=w, joinstyle="round")
+        cv.create_oval(*P(.35, .35), *P(.65, .65), outline=cor, width=w)
 
     elif tipo == "lupa":
         cv.create_oval(*P(.12, .12), *P(.64, .64), outline=cor, width=w)
@@ -958,7 +1208,7 @@ class Dialogo(tk.Toplevel):
     def ok(self):
         texto = self.texto.get("1.0", "end").strip()
         if not texto:
-            messagebox.showwarning("Aviso", "Digite a frase.", parent=self)
+            MensagemDialogo(self, self.c, self.f, "Frase vazia", "Digite a frase.", tipo="aviso")
             return
         self.resultado = {"categoria": self.cat.get().strip() or "Geral", "texto": texto}
         self.destroy()
@@ -1005,6 +1255,200 @@ class ConfirmarDialogo(tk.Toplevel):
 
     def ok(self):
         self.resultado = True
+        self.destroy()
+
+
+# Símbolos dos ícones de status, em coordenadas 0..1: lista de "cápsulas"
+# (x1, y1, x2, y2, raio). Segmento com raio = traço de ponta redonda; ponto = x1,y1 == x2,y2.
+_SIMBOLOS_STATUS = {
+    "ok":    [(0.29, 0.52, 0.44, 0.67, 0.062), (0.44, 0.67, 0.72, 0.35, 0.062)],
+    "aviso": [(0.50, 0.26, 0.50, 0.52, 0.066), (0.50, 0.73, 0.50, 0.73, 0.075)],
+    "erro":  [(0.50, 0.26, 0.50, 0.52, 0.066), (0.50, 0.73, 0.50, 0.73, 0.075)],
+    "info":  [(0.50, 0.27, 0.50, 0.27, 0.075), (0.50, 0.45, 0.50, 0.73, 0.066)],
+}
+
+
+def _dist_segmento(px, py, x1, y1, x2, y2):
+    dx, dy = x2 - x1, y2 - y1
+    comp = dx * dx + dy * dy
+    t = 0.0 if comp == 0 else max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / comp))
+    return math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
+
+
+def rasterizar_icone_status(tipo, tam, fundo, circulo, simbolo, ss=4):
+    """Desenha um ícone redondo com símbolo, com bordas suavizadas (supersampling).
+    Devolve linhas de pixels '#rrggbb'. Pura: não usa Tk."""
+    cap = _SIMBOLOS_STATUS.get(tipo, _SIMBOLOS_STATUS["info"])
+    cf, cc, cs = hex_para_rgb(fundo), hex_para_rgb(circulo), hex_para_rgb(simbolo)
+    raio = 0.5 - 0.5 / tam                    # deixa meio pixel de folga na borda
+    linhas = []
+    for j in range(tam):
+        linha = []
+        for i in range(tam):
+            r = g = b = 0
+            for sj in range(ss):
+                for si in range(ss):
+                    x = (i + (si + 0.5) / ss) / tam
+                    y = (j + (sj + 0.5) / ss) / tam
+                    if any(_dist_segmento(x, y, *seg[:4]) <= seg[4] for seg in cap):
+                        cor = cs
+                    elif math.hypot(x - 0.5, y - 0.5) <= raio:
+                        cor = cc
+                    else:
+                        cor = cf
+                    r += cor[0]; g += cor[1]; b += cor[2]
+            n = ss * ss
+            linha.append(rgb_para_hex(r / n, g / n, b / n))
+        linhas.append(linha)
+    return linhas
+
+
+def icone_status(master, tipo, tam, fundo, circulo, simbolo):
+    """tk.PhotoImage suavizado do ícone de status (guarde uma referência a ele!)."""
+    linhas = rasterizar_icone_status(tipo, tam, fundo, circulo, simbolo)
+    img = tk.PhotoImage(master=master, width=tam, height=tam)
+    img.put(" ".join("{" + " ".join(l) + "}" for l in linhas))
+    return img
+
+
+def _exibir_modal(janela, pai):
+    """Dimensiona a janela pelo conteúdo, centraliza sobre 'pai' e espera fechar."""
+    janela.update_idletasks()
+    w, h = max(janela.winfo_reqwidth(), 340), janela.winfo_reqheight()
+    janela.geometry(f"{w}x{h}")
+    posicionar_sobre(janela, pai, w, h)
+    janela.deiconify()
+    try:
+        janela.wait_visibility()
+        janela.grab_set()
+    except tk.TclError:
+        pass
+    janela.wait_window()
+
+
+class MensagemDialogo(tk.Toplevel):
+    """Aviso ou confirmação no estilo do app (substitui os messagebox cinzas do Tk).
+    tipo: "info", "ok", "aviso" ou "erro". resultado = True se clicou no botão principal."""
+    def __init__(self, pai, c, fonte, titulo, mensagem, tipo="info", rotulo_ok="OK",
+                 rotulo_cancelar=None, perigo=False):
+        super().__init__(pai, bg=c["bg"])
+        self.withdraw()
+        self.resultado = False
+        self.title(titulo)
+        self.resizable(False, False)
+        self.transient(pai)
+
+        cor = {"info": c["acento"], "ok": c["ok"], "aviso": c["perigo"],
+               "erro": c["perigo"]}.get(tipo, c["acento"])
+        cor_txt = c["acento_txt"] if tipo == "info" else "#ffffff"
+
+        corpo = tk.Frame(self, bg=c["bg"])
+        corpo.pack(fill="both", expand=True, padx=18, pady=16)
+
+        topo = tk.Frame(corpo, bg=c["bg"])
+        topo.pack(fill="x", pady=(0, 10))
+        self._img = icone_status(self, tipo, 30, c["bg"], cor, cor_txt)   # guarda a referência
+        tk.Label(topo, image=self._img, bg=c["bg"], bd=0).pack(side="left", padx=(0, 10))
+        tk.Label(topo, text=titulo, bg=c["bg"], fg=c["texto"],
+                 font=(fonte, 12, "bold")).pack(side="left")
+
+        tk.Label(corpo, text=mensagem, bg=c["bg"], fg=c["suave"], font=(fonte, 10),
+                 wraplength=310, justify="left").pack(anchor="w", pady=(0, 16))
+
+        rodape = tk.Frame(corpo, bg=c["bg"])
+        rodape.pack(fill="x")
+        if perigo:
+            principal = (c["perigo"], "#ffffff", c["perigo"])
+        else:
+            principal = (c["acento"], c["acento_txt"], c["acento_hover"])
+        botao(rodape, rotulo_ok, self.ok, *principal, fonte, True, 16, 7).pack(side="right")
+        if rotulo_cancelar:
+            botao(rodape, rotulo_cancelar, self.destroy, c["chip"], c["texto"], c["borda"],
+                  fonte, False, 14, 7).pack(side="right", padx=8)
+
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<Return>", lambda e: self.ok())
+        self.focus_set()
+        _exibir_modal(self, pai)
+
+    def ok(self):
+        self.resultado = True
+        self.destroy()
+
+
+class RestaurarDialogo(tk.Toplevel):
+    """Escolha de como restaurar o backup: duas opções em cartões clicáveis.
+    resultado = "mesclar", "substituir" ou None (cancelou)."""
+
+    def __init__(self, pai, c, fonte, n_frases):
+        super().__init__(pai, bg=c["bg"])
+        self.withdraw()
+        self.resultado = None
+        self.c, self.f = c, fonte
+        self.title("Restaurar backup")
+        self.resizable(False, False)
+        self.transient(pai)
+
+        corpo = tk.Frame(self, bg=c["bg"])
+        corpo.pack(fill="both", expand=True, padx=18, pady=16)
+
+        tk.Label(corpo, text="Restaurar backup", bg=c["bg"], fg=c["texto"],
+                 font=(fonte, 13, "bold")).pack(anchor="w")
+        tk.Label(corpo, text=f"O arquivo tem {n_frases} frase{'s' if n_frases != 1 else ''}. "
+                             "Como você quer restaurar?", bg=c["bg"], fg=c["suave"],
+                 font=(fonte, 10), wraplength=310, justify="left").pack(anchor="w", pady=(4, 12))
+
+        self._opcao(corpo, "Mesclar",
+                    "Mantém as suas frases e adiciona só as que ainda não existem.",
+                    c["acento"], "mesclar")
+        self._opcao(corpo, "Substituir tudo",
+                    "Troca todas as frases pelas do backup e aplica o tema e as cores salvos nele.",
+                    c["perigo"], "substituir")
+
+        rodape = tk.Frame(corpo, bg=c["bg"])
+        rodape.pack(fill="x", pady=(6, 0))
+        botao(rodape, "Cancelar", self.destroy, c["chip"], c["texto"], c["borda"],
+              fonte, False, 14, 7).pack(side="right")
+
+        self.bind("<Escape>", lambda e: self.destroy())
+        _exibir_modal(self, pai)
+
+    def _opcao(self, pai, titulo, descricao, cor, valor):
+        c, f = self.c, self.f
+        card = tk.Frame(pai, bg=c["card"], highlightthickness=1,
+                        highlightbackground=c["borda"], cursor="hand2")
+        card.pack(fill="x", pady=(0, 8))
+        interno = tk.Frame(card, bg=c["card"], cursor="hand2")
+        interno.pack(fill="x", padx=12, pady=10)
+        t = tk.Label(interno, text=titulo, bg=c["card"], fg=cor, font=(f, 11, "bold"),
+                     cursor="hand2", anchor="w")
+        t.pack(fill="x")
+        d = tk.Label(interno, text=descricao, bg=c["card"], fg=c["suave"], font=(f, 9),
+                     wraplength=290, justify="left", anchor="w", cursor="hand2")
+        d.pack(fill="x", pady=(2, 0))
+        partes = (card, interno, t, d)
+
+        def pintar(sobre):
+            fundo = c["card_hover"] if sobre else c["card"]
+            card.config(bg=fundo, highlightbackground=c["borda_hover"] if sobre else c["borda"])
+            for w in partes[1:]:
+                w.config(bg=fundo)
+
+        def sair(e=None):
+            try:
+                w = card.winfo_containing(*card.winfo_pointerxy())
+            except (tk.TclError, KeyError):
+                w = None
+            if not any(w is x for x in partes):
+                pintar(False)
+
+        for w in partes:
+            w.bind("<Enter>", lambda e: pintar(True))
+            w.bind("<Leave>", sair)
+            w.bind("<Button-1>", lambda e, v=valor: self._escolher(v))
+
+    def _escolher(self, valor):
+        self.resultado = valor
         self.destroy()
 
 
@@ -1477,10 +1921,10 @@ class DialogoConfiguracoes(tk.Toplevel):
         self.withdraw()          # fica escondida até estar pronta e posicionada
         self.c, self.f, self.tema = c, fonte, tema
         self.title("Configurações")
-        self.geometry("345x325")
+        self.geometry("345x500")
         self.resizable(False, False)
         self.transient(pai)
-        posicionar_sobre(self, pai, 345, 325)
+        posicionar_sobre(self, pai, 345, 500)
 
         corpo = tk.Frame(self, bg=c["bg"])
         corpo.pack(fill="both", expand=True, padx=16, pady=16)
@@ -1534,6 +1978,39 @@ class DialogoConfiguracoes(tk.Toplevel):
         self.btn_intervalo.pack(side="right")
         self.btn_intervalo.bind("<Button-1>", lambda e: self.alternar_intervalo())
 
+        # Iniciar com o computador
+        if AUTOSTART_SUPORTADO:
+            tk.Frame(moldura_copia, bg=c["borda"], height=1).pack(fill="x", padx=12)
+            sub_inicio = tk.Frame(moldura_copia, bg=c["card"])
+            sub_inicio.pack(fill="x", padx=12, pady=10)
+
+            tk.Label(sub_inicio, text="Iniciar com o computador", bg=c["card"], fg=c["texto"],
+                     font=(fonte, 10)).pack(side="left")
+
+            ativo = autostart_ativo()
+            self.btn_inicio_texto = tk.StringVar(value="Ativado" if ativo else "Desativado")
+            self.btn_inicio = tk.Label(
+                sub_inicio,
+                textvariable=self.btn_inicio_texto,
+                bg=c["acento"] if ativo else c["chip"],
+                fg=c["acento_txt"] if ativo else c["texto"],
+                padx=10, pady=4, font=(fonte, 9, "bold"), cursor="hand2"
+            )
+            self.btn_inicio.pack(side="right")
+            self.btn_inicio.bind("<Button-1>", lambda e: self.alternar_inicio())
+
+        # Seção Dados (backup)
+        tk.Label(corpo, text="DADOS", bg=c["bg"], fg=c["suave"],
+                 font=(fonte, 9, "bold")).pack(anchor="w", pady=(0, 6))
+
+        moldura_dados = tk.Frame(corpo, bg=c["card"], highlightthickness=1,
+                                 highlightbackground=c["borda"])
+        moldura_dados.pack(fill="x", pady=(0, 14))
+        self._linha_acao(moldura_dados, "Salvar backup das frases", "Salvar",
+                         self.fazer_backup, primeira=True)
+        self._linha_acao(moldura_dados, "Restaurar de um backup", "Restaurar",
+                         self.restaurar_backup, primeira=False)
+
         # Rodapé
         rodape = tk.Frame(corpo, bg=c["bg"])
         rodape.pack(fill="x", side="bottom")
@@ -1549,6 +2026,26 @@ class DialogoConfiguracoes(tk.Toplevel):
             pass
         self.wait_window()
 
+    def _linha_acao(self, moldura, texto, rotulo_botao, comando, primeira):
+        c = self.c
+        if not primeira:
+            tk.Frame(moldura, bg=c["borda"], height=1).pack(fill="x", padx=12)
+        linha = tk.Frame(moldura, bg=c["card"])
+        linha.pack(fill="x", padx=12, pady=10)
+        tk.Label(linha, text=texto, bg=c["card"], fg=c["texto"],
+                 font=(self.f, 10)).pack(side="left")
+        btn = tk.Label(linha, text=rotulo_botao, bg=c["acento"], fg=c["acento_txt"],
+                       padx=10, pady=4, font=(self.f, 9, "bold"), cursor="hand2")
+        btn.pack(side="right")
+        btn.bind("<Button-1>", lambda e: comando())
+
+    def fazer_backup(self):
+        self.master.exportar_backup(self)
+
+    def restaurar_backup(self):
+        if self.master.importar_backup(self):
+            self.destroy()
+
     def alternar_intervalo(self):
         atual = self.master.cfg.get("usar_intervalo", True)
         novo = not atual
@@ -1562,6 +2059,23 @@ class DialogoConfiguracoes(tk.Toplevel):
         else:
             self.btn_intervalo_texto.set("Desativado")
             self.btn_intervalo.config(bg=c["chip"], fg=c["texto"])
+
+    def alternar_inicio(self):
+        novo = not autostart_ativo()
+        if not definir_autostart(novo):
+            MensagemDialogo(self, self.c, self.f, "Aviso",
+                            "Não foi possível alterar a inicialização automática.", tipo="aviso")
+            return
+        self.master.cfg["iniciar_com_sistema"] = novo
+        _gravar(ARQUIVO_CFG, self.master.cfg)
+
+        c = self.c
+        if novo:
+            self.btn_inicio_texto.set("Ativado")
+            self.btn_inicio.config(bg=c["acento"], fg=c["acento_txt"])
+        else:
+            self.btn_inicio_texto.set("Desativado")
+            self.btn_inicio.config(bg=c["chip"], fg=c["texto"])
 
     def abrir_seletor_cor(self):
         cor_atual = self.master.cfg.get("cor_personalizada") or TEMAS[self.tema]["acento"]
@@ -1588,7 +2102,7 @@ class DialogoConfiguracoes(tk.Toplevel):
 
 
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, iniciar_recolhido=False):
         super().__init__()
         self.title("Frases Prontas")
         self.minsize(300, 360)
@@ -1634,6 +2148,8 @@ class App(tk.Tk):
         self._tinha_foco = False      # o app já recebeu foco desde que foi aberto/expandido?
         self._sem_foco_cont = 0
         self._expandido_em = None     # quando a barra lateral foi expandida pela última vez
+        self._bloqueios = 0           # >0 = há uma janela externa aberta: não recolher
+        self._livre_apos = 0.0        # folga após fechar uma janela externa
 
         precarregar_monitores()
         self.construir()
@@ -1651,6 +2167,19 @@ class App(tk.Tk):
         self.bind("<Control-f>", lambda e: self.entrada.focus_set())
         self.bind("<FocusOut>", self._ao_perder_foco)
         self.after(INTERVALO_VIGIA, self._vigiar_foco)
+
+        # Iniciar com o computador: ligado por padrão na primeira execução; nas seguintes,
+        # só atualiza o caminho (caso o app tenha sido movido) se o registro ainda existir
+        if AUTOSTART_SUPORTADO:
+            if "iniciar_com_sistema" not in self.cfg:
+                self.cfg["iniciar_com_sistema"] = definir_autostart(True)
+                _gravar(ARQUIVO_CFG, self.cfg)
+            elif self.cfg["iniciar_com_sistema"] and autostart_ativo():
+                definir_autostart(True)
+
+        # Aberto pelo login: já começa como barra lateral (a menos que esteja fixado)
+        if iniciar_recolhido and not self.fixado:
+            self.after(1200, self.recolher)
 
     def _icone_janela(self):
         """Ícone da janela/barra de tarefas (opcional: só se o arquivo existir)."""
@@ -1830,13 +2359,44 @@ class App(tk.Tk):
             pass
 
     def _dialogo_aberto(self):
-        """True se há uma janela modal aberta (configurações, cor, nova frase...).
-        Com um grab ativo o Tk bloqueia os eventos da barra lateral, então não dá
-        para recolher nesse momento."""
+        """True se há qualquer janela secundária aberta: nunca recolhe nesse caso.
+        Vale automaticamente para TODA tela nova (Toplevel visível ou com grab) e para
+        janelas externas do sistema (ver sem_recolher). Só a aba lateral, a janela de
+        arrasto e o menu de três pontos não contam."""
+        if self._bloqueios > 0 or time.monotonic() < self._livre_apos:
+            return True
+        # Há um grab ativo? Pergunta direto ao Tcl: grab_current() do tkinter dá KeyError
+        # quando a janela é do próprio Tk (messagebox, seletor de arquivos interno).
         try:
-            return self.grab_current() is not None
+            if str(self.tk.call("grab", "current")):
+                return True
+        except tk.TclError:
+            pass
+        try:
+            ignorar = (self.aba, self.drag_window, self.menu_aberto)
+            for w in self.winfo_children():
+                if isinstance(w, tk.Toplevel) and not any(w is x for x in ignorar) \
+                        and w.winfo_viewable():
+                    return True
         except (tk.TclError, KeyError):
-            return False
+            pass
+        return False
+
+    @contextmanager
+    def sem_recolher(self, parent=None):
+        """Use em volta de qualquer janela que NÃO é do Tk (seletor de arquivos do sistema,
+        etc.): enquanto ela estiver aberta o app não vira barra lateral."""
+        self._bloqueios += 1
+        try:
+            yield
+        finally:
+            self._bloqueios -= 1
+            self._livre_apos = time.monotonic() + 1.5
+            self._sem_foco_cont = 0
+            try:
+                (parent or self).focus_force()
+            except tk.TclError:
+                pass
 
     def recolher(self):
         if self.recolhido or self.fixado:
@@ -2034,7 +2594,7 @@ class App(tk.Tk):
 
         def icone_cab(tipo, comando):
             return IconeBotao(topo, tipo, comando, c["card"], c["texto"], c["chip"],
-                              tam=17, px=5, py=5, borda=c["borda"], bg_pai=c["bg"])
+                              tam=19, px=4, py=4, borda=c["borda"], bg_pai=c["bg"])
 
         # (ordem de empacotamento com side="right": o primeiro fica mais à direita)
         icone_cab("engrenagem", self.abrir_configuracoes).pack(side="right", padx=(6, 0))
@@ -2531,6 +3091,195 @@ class App(tk.Tk):
         else:
             self.resetar_destaques()
 
+    # ---------- janela de arquivos do sistema ----------
+    def _dialogo_arquivo_linux(self, parent, salvar, titulo, nome_inicial):
+        """Seletor nativo no Linux: kdialog (KDE/Qt) ou zenity (GTK, o mesmo do Chrome no
+        GNOME/Mint/Ubuntu). Devolve o caminho, "" se cancelou ou None se não deu para usar."""
+        pasta = os.path.expanduser("~")
+        desktop = (os.environ.get("XDG_CURRENT_DESKTOP") or "").upper()
+        kd, zn = shutil.which("kdialog"), shutil.which("zenity")
+        try:
+            wid = str(parent.winfo_id())     # janela-mãe: o seletor abre por cima dela
+        except tk.TclError:
+            wid = None
+
+        def montar(anexar):
+            if kd and ("KDE" in desktop or not zn):
+                args = [kd, "--title", titulo]
+                if anexar and wid:
+                    args += ["--attach", wid]
+                args += ["--getsavefilename" if salvar else "--getopenfilename",
+                         os.path.join(pasta, nome_inicial) if salvar else pasta,
+                         "*.json|Backup do Frases Prontas (*.json)\n*|Todos os arquivos"]
+                return args
+            if zn:
+                args = [zn, "--file-selection", "--title=" + titulo,
+                        "--file-filter=Backup do Frases Prontas | *.json",
+                        "--file-filter=Todos os arquivos | *"]
+                if anexar and wid:
+                    args += ["--modal", "--attach=" + wid]
+                if salvar:
+                    args += ["--save", "--confirm-overwrite",
+                             "--filename=" + os.path.join(pasta, nome_inicial)]
+                else:
+                    args.append("--filename=" + pasta + "/")
+                return args
+            return None
+
+        for anexar in (True, False):          # se esta versão não aceitar --attach, tenta sem
+            args = montar(anexar)
+            if args is None:
+                return None
+            try:
+                proc = subprocess.Popen(args, stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL, text=True)
+            except OSError:
+                return None
+            # espera sem travar a interface do app
+            pronto = tk.BooleanVar(master=self, value=False)
+
+            def vigiar(proc=proc, pronto=pronto):
+                if proc.poll() is None:
+                    self.after(80, vigiar)
+                else:
+                    pronto.set(True)
+            self.after(80, vigiar)
+            self.wait_variable(pronto)
+            saida = proc.stdout.read().strip()
+            if proc.returncode == 0:
+                return saida.splitlines()[0] if saida else ""
+            if proc.returncode == 1:          # cancelou
+                return ""
+        return None                           # erro: usa o seletor do Tk
+
+    def _pedir_arquivo(self, parent, salvar, titulo, nome_inicial=""):
+        """Abre a janela de salvar/abrir arquivo do sistema. Devolve o caminho ou ""."""
+        # "Sempre por cima" deixaria o seletor escondido atrás do app: desliga enquanto ele
+        # estiver aberto e restaura depois.
+        janelas, antes = [self, parent], []
+        for j in janelas:
+            try:
+                antes.append(bool(int(j.attributes("-topmost"))))
+                j.attributes("-topmost", False)
+            except (tk.TclError, ValueError, TypeError):
+                antes.append(None)
+        try:
+            with self.sem_recolher(parent):
+                if LINUX:
+                    r = self._dialogo_arquivo_linux(parent, salvar, titulo, nome_inicial)
+                    if r is not None:
+                        return r
+                tipos = [("Backup do Frases Prontas", "*.json"), ("Todos os arquivos", "*.*")]
+                if salvar:
+                    return filedialog.asksaveasfilename(
+                        parent=parent, title=titulo, defaultextension=".json",
+                        initialfile=nome_inicial, filetypes=tipos) or ""
+                return filedialog.askopenfilename(
+                    parent=parent, title=titulo, filetypes=tipos) or ""
+        finally:
+            for j, valor in zip(janelas, antes):
+                if valor is None:
+                    continue
+                try:
+                    j.attributes("-topmost", valor)
+                except tk.TclError:
+                    pass
+
+    # ---------- backup ----------
+    def exportar_backup(self, parent):
+        caminho = self._pedir_arquivo(parent, True, "Salvar backup das frases",
+                                      f"frases-backup-{time.strftime('%Y-%m-%d')}.json")
+        if not caminho:
+            return
+        if not os.path.splitext(caminho)[1]:
+            caminho += ".json"
+        try:
+            gravar_backup(caminho, self.dados, self.cfg)
+        except OSError as e:
+            MensagemDialogo(parent, self.c, self.f, "Não foi possível salvar",
+                            f"O backup não pôde ser gravado:\n{e}", tipo="erro")
+            return
+        n = len(self.dados)
+        MensagemDialogo(
+            parent, self.c, self.f, "Backup salvo",
+            f"{n} frase{'s' if n != 1 else ''} salva{'s' if n != 1 else ''} em:\n{caminho}\n\n"
+            "Para restaurar o backup, selecione a opção Restaurar e escolha o arquivo de backup.", tipo="ok")
+
+    def _copia_antes_de_restaurar(self):
+        try:
+            if os.path.exists(ARQUIVO):
+                shutil.copy2(ARQUIVO,
+                             os.path.join(CONFIG_DIR, "frases-antes-da-restauracao.json"))
+        except OSError:
+            pass
+
+    def importar_backup(self, parent):
+        """Pergunta o arquivo e como restaurar. Devolve True se algo foi alterado."""
+        caminho = self._pedir_arquivo(parent, False, "Escolher backup para restaurar")
+        if not caminho:
+            return False
+        try:
+            frases, cfg = ler_backup(caminho)
+        except ValueError as e:
+            MensagemDialogo(parent, self.c, self.f, "Backup inválido", str(e), tipo="erro")
+            return False
+        except OSError as e:
+            MensagemDialogo(parent, self.c, self.f, "Não foi possível abrir",
+                            f"O arquivo não pôde ser lido:\n{e}", tipo="erro")
+            return False
+
+        n = len(frases)
+        escolha = RestaurarDialogo(parent, self.c, self.f, n).resultado
+        if escolha is None:
+            return False
+
+        visual_mudou = False
+        if escolha == "mesclar":
+            novas, adicionadas = mesclar_frases(self.dados, frases)
+            if adicionadas == 0:
+                MensagemDialogo(parent, self.c, self.f, "Nada a restaurar",
+                                "Todas as frases do backup já estavam no app.\n"
+                                "Nada foi alterado.", tipo="info")
+                return False
+            self._copia_antes_de_restaurar()
+            self.dados = novas
+            msg = f"{adicionadas} frase{'s' if adicionadas != 1 else ''} adicionada" \
+                  f"{'s' if adicionadas != 1 else ''}"
+        else:                                           # substituir
+            if self.dados and not MensagemDialogo(
+                    parent, self.c, self.f, "Substituir tudo?",
+                    f"Isso troca as suas {len(self.dados)} frases atuais pelas {n} do backup.\n\n"
+                    "Uma cópia das atuais fica guardada na pasta de configuração do app.",
+                    tipo="aviso", rotulo_ok="Substituir", rotulo_cancelar="Cancelar",
+                    perigo=True).resultado:
+                return False
+            self._copia_antes_de_restaurar()
+            self.dados = frases
+            if cfg is not None:
+                for k in CFG_NO_BACKUP:
+                    if k in cfg:
+                        self.cfg[k] = cfg[k]
+                    else:
+                        self.cfg.pop(k, None)
+                self.tema = self.cfg.get("tema", "claro")
+                if self.tema not in TEMAS:
+                    self.tema = "claro"
+                visual_mudou = True
+            msg = f"Backup restaurado: {n} frase{'s' if n != 1 else ''}"
+
+        _gravar(ARQUIVO, self.dados)
+        _gravar(ARQUIVO_CFG, self.cfg)
+        self.categoria = "Todas"
+        if visual_mudou:
+            self.construir()            # reaplica tema e cores
+        else:
+            self.desenhar_chips()
+            self.listar()
+        total = len(self.dados)
+        self.mostrar_rodape(msg, self.c["acento"],
+                            volta=f"{total} frase{'s' if total != 1 else ''}  ·  clique para copiar")
+        return True
+
     def abrir_configuracoes(self):
         """Abre a tela de opções de configuração."""
         DialogoConfiguracoes(self, self.c, self.f, self.tema)
@@ -2543,4 +3292,4 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    App(iniciar_recolhido=FLAG_RECOLHIDO in sys.argv[1:]).mainloop()
