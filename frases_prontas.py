@@ -16,6 +16,7 @@ Windows: só o Python oficial (já inclui o Tkinter). Nada mais a instalar.
 Ícone da janela (opcional): coloque "icone.png" (Linux) ou "icone.ico" (Windows)
 na mesma pasta do script.
 """
+import copy
 import json
 import colorsys
 from contextlib import contextmanager
@@ -45,6 +46,8 @@ else:
 
 ARQUIVO = os.path.join(CONFIG_DIR, "frases.json")
 ARQUIVO_CFG = os.path.join(CONFIG_DIR, "config.json")
+ARQUIVO_TRAVA = os.path.join(CONFIG_DIR, "instancia.lock")     # trava de instância única (Linux)
+ARQUIVO_MOSTRAR = os.path.join(CONFIG_DIR, "mostrar.flag")     # 2ª instância pede: "apareça"
 
 TEMAS = {
     "claro": dict(bg="#f3f4f8", card="#ffffff", borda="#e2e5ec", texto="#1f2933",
@@ -80,12 +83,18 @@ ALTURA_ABA = 120              # altura da barra, em pixels
 # Ícones do cabeçalho: espessura do traço em pixels (1 = fino/minimalista, 2 = mais marcado)
 ESPESSURA_ICONE = 1
 
+# Telas com escala de 125% / 150% (Windows). Sem ajuste, o Windows amplia a janela como se
+# fosse uma imagem e o texto fica levemente borrado. Opções:
+#   "gdi"    = o Windows desenha o texto já na escala real e o tamanho da janela não muda
+#              (recomendado; vale para o Windows 10 recente, nos antigos fica como "nenhum")
+#   "nitido" = texto 100% nítido, mas a janela fica fisicamente menor em telas de alta resolução
+#   "nenhum" = como antes (o Windows amplia a imagem)
+DPI_MODO = "gdi"
+
 EXEMPLOS = [
-    {"categoria": "Saudações", "texto": "Olá! Tudo bem? Como posso ajudar?"},
-    {"categoria": "Saudações", "texto": "Obrigado pelo contato! Retorno em breve."},
-    {"categoria": "Atendimento", "texto": "Um momento, por favor, vou verificar essa informação para você."},
-    {"categoria": "Atendimento", "texto": "Fico à disposição para qualquer dúvida."},
-    {"categoria": "Email", "texto": "Atenciosamente,\nSeu Nome"},
+    {"categoria": "Atendimento", "texto": "Bom dia"},
+    {"categoria": "Atendimento", "texto": "Em que posso ajudar ?"},
+    {"categoria": "Atendimento", "texto": "Me passa o acesso do AnyDesk por gentileza"},
 ]
 
 
@@ -108,20 +117,34 @@ def _ler(caminho, padrao):
     return padrao
 
 
-def _gravar(caminho, dados):
-    """Grava em arquivo temporário e troca de uma vez: não deixa o JSON pela metade."""
-    os.makedirs(CONFIG_DIR, exist_ok=True)
+def _gravar(caminho, dados, tentativas=4):
+    """Grava em arquivo temporário e troca de uma vez: não deixa o JSON pela metade.
+    No Windows, antivírus ou programas de sincronização podem segurar o arquivo por
+    instantes (PermissionError): por isso tenta algumas vezes antes de desistir.
+    Se não conseguir, levanta OSError (quem chamou decide como avisar)."""
     tmp = caminho + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(dados, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    if os.path.exists(caminho):
+    for n in range(tentativas):
         try:
-            shutil.copy2(caminho, caminho + ".bak")
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(dados, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            if os.path.exists(caminho):
+                try:
+                    shutil.copy2(caminho, caminho + ".bak")
+                except OSError:
+                    pass
+            os.replace(tmp, caminho)
+            return
         except OSError:
-            pass
-    os.replace(tmp, caminho)
+            if n == tentativas - 1:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                raise
+            time.sleep(0.15)
 
 
 # ---------- backup (exportar / restaurar) ----------
@@ -220,6 +243,53 @@ def mesclar_frases(atuais, novas):
     return final, add
 
 
+def sanear_frases(bruto):
+    """Valida a lista lida de frases.json. Devolve (frases_validas, descartados).
+    'descartados' = quantos itens foram ignorados, ou None se o conteúdo nem era uma lista."""
+    if not isinstance(bruto, list):
+        return [], None
+    frases = []
+    for d in bruto:
+        if isinstance(d, dict) and isinstance(d.get("texto"), str) and d["texto"].strip():
+            item = dict(d)
+            cat = d.get("categoria")
+            item["categoria"] = cat.strip() if isinstance(cat, str) and cat.strip() else "Geral"
+            frases.append(item)
+    return frases, len(bruto) - len(frases)
+
+
+def sanear_cfg(bruto):
+    """Valida o config.json. Devolve (config_valida, houve_problema).
+    Valores fora do formato são descartados (o app volta ao padrão deles)."""
+    if not isinstance(bruto, dict):
+        return {}, True
+    cfg, ruim = dict(bruto), False
+    if "tema" in cfg and not (isinstance(cfg["tema"], str) and cfg["tema"] in TEMAS):
+        del cfg["tema"]
+        ruim = True
+    if "cor_personalizada" in cfg:
+        cor = hex_valido(cfg["cor_personalizada"]) if isinstance(cfg["cor_personalizada"], str) else None
+        if cor:
+            cfg["cor_personalizada"] = cor
+        else:
+            del cfg["cor_personalizada"]
+            ruim = True
+    for chave in ("fixado", "usar_intervalo", "iniciar_com_sistema"):
+        if chave in cfg and not isinstance(cfg[chave], bool):
+            del cfg[chave]
+            ruim = True
+    return cfg, ruim
+
+
+def guardar_copia_invalida(caminho):
+    """Antes de o app sobrescrever um arquivo com problema, guarda uma cópia dele."""
+    try:
+        if os.path.exists(caminho):
+            shutil.copy2(caminho, caminho + ".invalido-" + time.strftime("%Y%m%d-%H%M%S"))
+    except OSError:
+        pass
+
+
 def escolher_fonte(root):
     disponiveis = set(tkfont.families(root))
     for nome in ("Segoe UI", "Inter", "Noto Sans", "Ubuntu", "Cantarell", "Open Sans", "DejaVu Sans"):
@@ -314,6 +384,50 @@ def definir_autostart(ligado):
         return True
     except Exception:
         return False
+
+
+# ---------- instância única ----------
+_TRAVA = None        # mantém a trava viva enquanto o app roda (o sistema solta ao encerrar)
+
+
+def obter_instancia_unica():
+    """True se esta é a única instância aberta. Se não for possível verificar, devolve
+    True: um problema na trava nunca pode impedir o app de abrir."""
+    global _TRAVA
+    try:
+        if WINDOWS:
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+            k32.CreateMutexW.restype = wintypes.HANDLE
+            h = k32.CreateMutexW(None, False, "Local\\FrasesProntas_instancia_unica")
+            if not h:
+                return True
+            _TRAVA = h
+            return ctypes.get_last_error() != 183          # 183 = ERROR_ALREADY_EXISTS
+        import fcntl
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        f = open(ARQUIVO_TRAVA, "a+")
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, PermissionError):
+            f.close()
+            return False
+        _TRAVA = f
+        return True
+    except Exception:
+        return True
+
+
+def pedir_para_mostrar():
+    """Avisa a instância que já está aberta para aparecer (a aberta confere o arquivo)."""
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(ARQUIVO_MOSTRAR, "w", encoding="utf-8") as f:
+            f.write("1")
+    except OSError:
+        pass
 
 
 # ---------- área de transferência ----------
@@ -1020,11 +1134,13 @@ class MenuPopup(tk.Toplevel):
             l.bind("<Button-1>", lambda e, cmd=comando: ao_escolher(cmd))
         self.update_idletasks()
         w, h = self.winfo_reqwidth(), self.winfo_reqheight()
-        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        x = max(0, min(x_dir - w, sw - w))
+        # usa o monitor onde o cartão está (não só a tela principal)
+        mx, my, mw, mh = monitor_do_ponto(listar_monitores(self),
+                                          x_dir - 1, y_base - altura_botao / 2)
+        x = max(mx, min(x_dir - w, mx + mw - w))
         y = y_base
-        if y + h > sh:                       # sem espaço embaixo: abre para cima
-            y = max(0, y_base - altura_botao - h)
+        if y + h > my + mh:                  # sem espaço embaixo: abre para cima
+            y = max(my, y_base - altura_botao - h)
         self.geometry(f"+{int(x)}+{int(y)}")
         try:
             self.attributes("-topmost", True)
@@ -2050,7 +2166,7 @@ class DialogoConfiguracoes(tk.Toplevel):
         atual = self.master.cfg.get("usar_intervalo", True)
         novo = not atual
         self.master.cfg["usar_intervalo"] = novo
-        _gravar(ARQUIVO_CFG, self.master.cfg)
+        self.master.gravar(ARQUIVO_CFG, self.master.cfg, self)
 
         c = self.c
         if novo:
@@ -2067,7 +2183,7 @@ class DialogoConfiguracoes(tk.Toplevel):
                             "Não foi possível alterar a inicialização automática.", tipo="aviso")
             return
         self.master.cfg["iniciar_com_sistema"] = novo
-        _gravar(ARQUIVO_CFG, self.master.cfg)
+        self.master.gravar(ARQUIVO_CFG, self.master.cfg, self)
 
         c = self.c
         if novo:
@@ -2090,7 +2206,7 @@ class DialogoConfiguracoes(tk.Toplevel):
         else:
             self.master.cfg["cor_personalizada"] = resultado
 
-        _gravar(ARQUIVO_CFG, self.master.cfg)
+        self.master.gravar(ARQUIVO_CFG, self.master.cfg, self)
         self.master.construir()
         self.destroy()
         self.master.mostrar_rodape(
@@ -2104,15 +2220,24 @@ class DialogoConfiguracoes(tk.Toplevel):
 class App(tk.Tk):
     def __init__(self, iniciar_recolhido=False):
         super().__init__()
+        if WINDOWS and _DPI_NITIDO_ATIVO:
+            # com DPI ligado o Tk aumentaria as fontes, mas os tamanhos em pixels do layout
+            # são fixos: mantém a escala de 96 dpi para tudo continuar do mesmo tamanho
+            try:
+                self.tk.call("tk", "scaling", 96 / 72)
+            except tk.TclError:
+                pass
         self.title("Frases Prontas")
         self.minsize(300, 360)
         self._icone_janela()
-        self.dados = _ler(ARQUIVO, list(EXEMPLOS))
-        self.cfg = _ler(ARQUIVO_CFG, {})
+        self._aviso_dados = None
+        self.dados, self.cfg = self._carregar_dados()
         self.tema = self.cfg.get("tema", "claro")
         if self.tema not in TEMAS:
             self.tema = "claro"
         self.fixado = bool(self.cfg.get("fixado", False))
+        if iniciar_recolhido and not self.fixado:
+            self.withdraw()          # aberto pelo login: a janela nem chega a aparecer
         self.categoria = "Todas"
         self.busca = tk.StringVar()
         self.busca.trace_add("write", lambda *_: self.listar())
@@ -2155,6 +2280,15 @@ class App(tk.Tk):
         self.construir()
         self.posicionar()
         self.aplicar_fixar()
+        if self._aviso_dados:                     # fica no rodapé até a próxima ação
+            self.mostrar_rodape(self._aviso_dados, self.c["perigo"])
+
+        # pedido de outra instância ("apareça"): ignora o que sobrou de execuções antigas
+        try:
+            os.remove(ARQUIVO_MOSTRAR)
+        except OSError:
+            pass
+        self.after(500, self._ver_pedido)
 
         self.bind_all("<Button-4>", lambda e: self.rolar(-3))
         self.bind_all("<Button-5>", lambda e: self.rolar(3))
@@ -2173,13 +2307,51 @@ class App(tk.Tk):
         if AUTOSTART_SUPORTADO:
             if "iniciar_com_sistema" not in self.cfg:
                 self.cfg["iniciar_com_sistema"] = definir_autostart(True)
-                _gravar(ARQUIVO_CFG, self.cfg)
+                self.gravar(ARQUIVO_CFG, self.cfg, avisar=False)
             elif self.cfg["iniciar_com_sistema"] and autostart_ativo():
                 definir_autostart(True)
 
         # Aberto pelo login: já começa como barra lateral (a menos que esteja fixado)
         if iniciar_recolhido and not self.fixado:
-            self.after(1200, self.recolher)
+            try:
+                self.recolher()
+            except Exception:                     # se algo falhar, ao menos o app aparece
+                self.recolhido = False
+                if self.aba is not None:
+                    try:
+                        self.aba.destroy()
+                    except tk.TclError:
+                        pass
+                    self.aba = None
+                self.deiconify()
+
+    def _carregar_dados(self):
+        """Lê frases e configurações. O que estiver fora do formato (arquivo editado à mão,
+        versão antiga, etc.) é ignorado em vez de impedir o app de abrir; antes, guarda uma
+        cópia do arquivo original."""
+        problemas = []
+
+        bruto = _ler(ARQUIVO, None)
+        if bruto is None:                          # primeira execução: frases iniciais
+            frases = copy.deepcopy(EXEMPLOS)
+        else:
+            frases, descartados = sanear_frases(bruto)
+            if descartados is None:                # não era uma lista
+                frases = copy.deepcopy(EXEMPLOS)
+            if descartados is None or descartados > 0:
+                guardar_copia_invalida(ARQUIVO)
+                problemas.append("frases")
+
+        bruto_cfg = _ler(ARQUIVO_CFG, {})
+        cfg, ruim = sanear_cfg(bruto_cfg)
+        if ruim:
+            guardar_copia_invalida(ARQUIVO_CFG)
+            problemas.append("configurações")
+
+        if problemas:
+            self._aviso_dados = ("Dados com erro foram ignorados (" + " e ".join(problemas)
+                                 + "). Cópia guardada.")
+        return frases, cfg
 
     def _icone_janela(self):
         """Ícone da janela/barra de tarefas (opcional: só se o arquivo existir)."""
@@ -2195,6 +2367,25 @@ class App(tk.Tk):
                     self._img_icone = tk.PhotoImage(file=png)
                     self.iconphoto(True, self._img_icone)
         except tk.TclError:
+            pass
+
+    def _ver_pedido(self):
+        """Outra instância foi aberta (ex.: atalho clicado de novo): em vez de duplicar,
+        esta aparece."""
+        try:
+            self.after(500, self._ver_pedido)
+        except tk.TclError:
+            return
+        try:
+            if not os.path.exists(ARQUIVO_MOSTRAR):
+                return
+            os.remove(ARQUIVO_MOSTRAR)
+            if self.recolhido:
+                self.expandir()
+            else:
+                self.deiconify()
+                self._trazer_para_frente()
+        except (OSError, tk.TclError):
             pass
 
     # ---------- fixar na tela (sempre por cima) ----------
@@ -2219,7 +2410,7 @@ class App(tk.Tk):
     def alternar_fixar(self):
         self.fixado = not self.fixado
         self.cfg["fixado"] = self.fixado
-        _gravar(ARQUIVO_CFG, self.cfg)
+        self.gravar(ARQUIVO_CFG, self.cfg)
         self.aplicar_fixar()
         self.atualizar_pin()
         self.mostrar_rodape(
@@ -2398,6 +2589,18 @@ class App(tk.Tk):
             except tk.TclError:
                 pass
 
+    def _retangulo_janela(self):
+        """(x, y, largura, altura) da janela. Se ela ainda não foi exibida (abertura pelo
+        login), usa a geometria definida, porque winfo_* só valem para janela visível."""
+        self.update_idletasks()
+        if self.winfo_viewable():
+            return self.winfo_rootx(), self.winfo_rooty(), self.winfo_width(), self.winfo_height()
+        m = re.match(r"(\d+)x(\d+)[+-](-?\d+)[+-](-?\d+)", self.geometry())
+        if m:
+            w, h, x, y = (int(v) for v in m.groups())
+            return x, y, w, h
+        return 0, 0, LARGURA, ALTURA
+
     def recolher(self):
         if self.recolhido or self.fixado:
             return
@@ -2407,10 +2610,8 @@ class App(tk.Tk):
         self._tinha_foco = False
         self._sem_foco_cont = 0
         self.fechar_menu()
-        self.update_idletasks()
+        x, y, larg, alt = self._retangulo_janela()
         self.geo_salva = self.geometry()
-        larg, alt = self.winfo_width(), self.winfo_height()
-        x, y = self.winfo_rootx(), self.winfo_rooty()
 
         # monitor onde a janela está
         cx, cy = x + larg / 2, y + alt / 2
@@ -2809,11 +3010,30 @@ class App(tk.Tk):
             self._toast_id = self.after(2200, lambda: self.mostrar_rodape(volta))
 
     # ---------- dados ----------
+    def gravar(self, caminho, dados, parent=None, avisar=True):
+        """Grava no disco. Se falhar, avisa o usuário em vez de falhar em silêncio.
+        Devolve True se gravou."""
+        try:
+            _gravar(caminho, dados)
+            return True
+        except OSError as e:
+            self._dbg("falha ao gravar %s: %r" % (caminho, e))
+            if avisar:
+                self.mostrar_rodape("Não foi possível gravar em disco", self.c["perigo"],
+                                    volta="clique para copiar")
+                MensagemDialogo(
+                    parent or self, self.c, self.f, "Não foi possível salvar",
+                    "A alteração vale por enquanto, mas não foi gravada em disco e pode "
+                    "se perder ao fechar o app.\n\n"
+                    "Se um antivírus ou programa de sincronização estiver usando a pasta "
+                    "de configuração, tente de novo em instantes.\n\n" + str(e), tipo="erro")
+            return False
+
     def categorias(self):
         return sorted({d["categoria"] for d in self.dados})
 
     def salvar(self, chips=True):
-        _gravar(ARQUIVO, self.dados)
+        self.gravar(ARQUIVO, self.dados)
         if chips:
             self.desenhar_chips()
 
@@ -2940,7 +3160,7 @@ class App(tk.Tk):
         self.arrastando = None
 
         cards = list(self.cartoes_widgets)
-        self.mostrar_rodape(f"{len(cards)} frases  ·  clique para copiar")
+        self.mostrar_rodape(f"{len(cards)} frase{'s' if len(cards) != 1 else ''}  ·  clique para copiar")
         if slot is None:
             return
 
@@ -3267,8 +3487,8 @@ class App(tk.Tk):
                 visual_mudou = True
             msg = f"Backup restaurado: {n} frase{'s' if n != 1 else ''}"
 
-        _gravar(ARQUIVO, self.dados)
-        _gravar(ARQUIVO_CFG, self.cfg)
+        self.gravar(ARQUIVO, self.dados, parent)
+        self.gravar(ARQUIVO_CFG, self.cfg, parent)
         self.categoria = "Todas"
         if visual_mudou:
             self.construir()            # reaplica tema e cores
@@ -3287,9 +3507,54 @@ class App(tk.Tk):
     def alternar_tema(self):
         self.tema = "escuro" if self.tema == "claro" else "claro"
         self.cfg["tema"] = self.tema
-        _gravar(ARQUIVO_CFG, self.cfg)
+        self.gravar(ARQUIVO_CFG, self.cfg)
         self.construir()
 
 
+_DPI_NITIDO_ATIVO = False
+
+
+def configurar_dpi():
+    """Windows: chamar ANTES de criar a janela. Não faz nada nos outros sistemas, e qualquer
+    falha é ignorada (o app só fica como era antes)."""
+    global _DPI_NITIDO_ATIVO
+    if not WINDOWS or DPI_MODO not in ("gdi", "nitido"):
+        return
+    try:
+        import ctypes
+        if DPI_MODO == "gdi":
+            # "UNAWARE_GDISCALED" (-5): continua sem escala própria (mesmos tamanhos), mas o
+            # texto e os traços são desenhados na resolução real da tela.
+            u32 = ctypes.windll.user32
+            u32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+            u32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-5))
+            return
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)      # 1 = ciente do DPI do sistema
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()
+        _DPI_NITIDO_ATIVO = True       # a App fixa a escala das fontes (ver __init__)
+    except Exception:
+        pass
+
+
+def _definir_id_windows():
+    """Faz a barra de tarefas tratar o app como programa próprio (com o ícone dele e
+    agrupado à parte), e não como mais uma janela do Python."""
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    App(iniciar_recolhido=FLAG_RECOLHIDO in sys.argv[1:]).mainloop()
+    recolhido = FLAG_RECOLHIDO in sys.argv[1:]
+    if not obter_instancia_unica():
+        if not recolhido:              # aberto à mão: faz a instância existente aparecer
+            pedir_para_mostrar()
+        sys.exit(0)
+    if WINDOWS:
+        _definir_id_windows()
+        configurar_dpi()
+    App(iniciar_recolhido=recolhido).mainloop()
