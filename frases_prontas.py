@@ -11,23 +11,37 @@ Linux - opcionais:
   xrandr                 (detecta vários monitores)
   zenity ou kdialog      (janela de salvar/abrir arquivo igual à do navegador)
 
+Linux - bandeja do sistema (ícones perto do relógio), precisa de UM destes:
+  Mint/Cinnamon:  sudo apt install python3-gi gir1.2-xapp-1.0      (já vêm no Mint)
+  Ubuntu/Debian:  sudo apt install python3-gi gir1.2-ayatanaappindicator3-0.1
+  Fedora:         sudo dnf install python3-gobject libayatana-appindicator-gtk3
+  Arch:           sudo pacman -S python-gobject libayatana-appindicator
+  GNOME puro não mostra ícones de bandeja: instale a extensão "AppIndicator and
+  KStatusNotifierItem Support". Se não houver bandeja, o app continua na barra de tarefas.
+
 Windows: só o Python oficial (já inclui o Tkinter). Nada mais a instalar.
+  O app fica na bandeja do sistema (ícones perto do relógio): clique abre, botão direito = Abrir/Sair.
 
 Ícone da janela (opcional): coloque "icone.png" (Linux) ou "icone.ico" (Windows)
 na mesma pasta do script.
 """
+import atexit
 import copy
+import ctypes
+import ctypes.util
 import json
 import colorsys
 from contextlib import contextmanager
 import math
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
+import traceback
 import tkinter as tk
 from tkinter import font as tkfont
 from tkinter import filedialog
@@ -76,6 +90,7 @@ INTERVALO_COPIA = 1.5
 # Barra lateral (quando o app não está fixado e perde o foco)
 RECOLHER_AUTOMATICO = True    # False = nunca recolhe
 INTERVALO_VIGIA = 50          # ms entre checagens do foco (menor = recolhe mais rápido)
+INTERVALO_VIGIA_OCIOSO = 500  # ms entre checagens quando o app está recolhido ou fixado (nada a vigiar)
 ESPERA_FOCUS_OUT = 60         # ms de espera após o evento FocusOut antes de confirmar
 LARGURA_ABA = 12              # largura da barra, em pixels
 ALTURA_ABA = 120              # altura da barra, em pixels
@@ -99,16 +114,21 @@ EXEMPLOS = [
 
 
 # ---------- arquivos (leitura/gravação seguras) ----------
+_CORROMPIDOS = set()      # arquivos que _ler encontrou corrompidos (para o app avisar)
+
+
 def _ler(caminho, padrao):
-    """Lê o JSON. Se estiver corrompido, guarda uma cópia e tenta o backup (.bak)."""
+    """Lê o JSON. Se estiver corrompido, guarda uma cópia e tenta o backup (.bak).
+    Aceita UTF-8 com BOM (o Bloco de Notas do Windows grava assim)."""
     for tentativa in (caminho, caminho + ".bak"):
         try:
-            with open(tentativa, "r", encoding="utf-8") as f:
+            with open(tentativa, "r", encoding="utf-8-sig") as f:
                 return json.load(f)
         except FileNotFoundError:
             continue
         except (json.JSONDecodeError, UnicodeDecodeError, OSError):
             if tentativa == caminho:
+                _CORROMPIDOS.add(caminho)
                 try:
                     os.replace(caminho, caminho + ".corrompido")
                 except OSError:
@@ -574,7 +594,10 @@ def _monitores_linux():
                 m = re.search(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", linha)
                 if m:
                     w, h, x, y = (int(v) for v in m.groups())
-                    mons.append((x, y, w, h))
+                    if " connected primary" in linha:
+                        mons.insert(0, (x, y, w, h))        # o principal vem primeiro
+                    else:
+                        mons.append((x, y, w, h))
     except Exception:
         pass
     return mons
@@ -596,10 +619,11 @@ def _monitores_windows():
         ctypes.windll.user32.EnumDisplayMonitors(None, None, proc(cb), 0)
     except Exception:
         return []
+    mons.sort(key=lambda m: (m[0] != 0 or m[1] != 0))     # o principal (0, 0) vem primeiro
     return mons
 
 
-_MON = {"dados": None, "t": 0.0, "ocupado": False}
+_MON = {"dados": None, "t": 0.0, "ocupado": False, "thread": None}
 
 
 def _atualizar_monitores():
@@ -618,7 +642,9 @@ def precarregar_monitores():
     if _MON["ocupado"]:
         return
     _MON["ocupado"] = True
-    threading.Thread(target=_atualizar_monitores, daemon=True).start()
+    th = threading.Thread(target=_atualizar_monitores, daemon=True)
+    _MON["thread"] = th
+    th.start()
 
 
 def listar_monitores(root):
@@ -645,6 +671,249 @@ def monitor_do_ponto(mons, px, py):
         if menor is None or d < menor:
             melhor, menor = m, d
     return melhor
+
+
+# ---------- ícone na bandeja do sistema (Windows) ----------
+# Os "ícones pequenos" perto do relógio. Sem nenhuma biblioteca extra: usa a API do Windows
+# direto (ctypes). As mensagens do ícone chegam pela própria janela oculta criada aqui, que
+# roda no mesmo laço do Tk, então os cliques são tratados na thread principal.
+BANDEJA_SUPORTADA = WINDOWS or LINUX
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [("Data1", ctypes.c_uint32), ("Data2", ctypes.c_uint16),
+                ("Data3", ctypes.c_uint16), ("Data4", ctypes.c_ubyte * 8)]
+
+
+class _NOTIFYICONDATA(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_uint32), ("hWnd", ctypes.c_void_p),
+                ("uID", ctypes.c_uint32), ("uFlags", ctypes.c_uint32),
+                ("uCallbackMessage", ctypes.c_uint32), ("hIcon", ctypes.c_void_p),
+                ("szTip", ctypes.c_wchar * 128), ("dwState", ctypes.c_uint32),
+                ("dwStateMask", ctypes.c_uint32), ("szInfo", ctypes.c_wchar * 256),
+                ("uVersion", ctypes.c_uint32), ("szInfoTitle", ctypes.c_wchar * 64),
+                ("dwInfoFlags", ctypes.c_uint32), ("guidItem", _GUID),
+                ("hBalloonIcon", ctypes.c_void_p)]
+
+
+class _WNDCLASS(ctypes.Structure):
+    _fields_ = [("style", ctypes.c_uint32), ("lpfnWndProc", ctypes.c_void_p),
+                ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                ("hInstance", ctypes.c_void_p), ("hIcon", ctypes.c_void_p),
+                ("hCursor", ctypes.c_void_p), ("hbrBackground", ctypes.c_void_p),
+                ("lpszMenuName", ctypes.c_wchar_p), ("lpszClassName", ctypes.c_wchar_p)]
+
+
+class _ICONINFO(ctypes.Structure):
+    _fields_ = [("fIcon", ctypes.c_int32), ("xHotspot", ctypes.c_uint32),
+                ("yHotspot", ctypes.c_uint32), ("hbmMask", ctypes.c_void_p),
+                ("hbmColor", ctypes.c_void_p)]
+
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+def pixels_icone_bandeja(tam, cor_hex):
+    """Pixels BGRA (bytes) de um círculo na cor do app com um traço claro no meio, com as
+    bordas suavizadas. É o ícone usado quando não existe 'icone.ico' ao lado do script."""
+    r0, g0, b0 = hex_para_rgb(hex_valido(cor_hex) or "#4f6df5")
+    cx = cy = tam / 2.0
+    raio2 = (tam / 2.0 - 0.5) ** 2
+    meia_larg = max(1.0, tam / 12.0)
+    meia_alt = tam * 0.24
+    ss = 4
+    saida = bytearray()
+    for y in range(tam):
+        for x in range(tam):
+            dentro = traco = 0
+            for sy in range(ss):
+                py = y + (sy + 0.5) / ss
+                for sx in range(ss):
+                    px = x + (sx + 0.5) / ss
+                    if (px - cx) ** 2 + (py - cy) ** 2 <= raio2:
+                        dentro += 1
+                        if abs(px - cx) <= meia_larg and abs(py - cy) <= meia_alt:
+                            traco += 1
+            if not dentro:
+                saida += b"\x00\x00\x00\x00"
+                continue
+            f = traco / dentro                       # quanto do pixel é o traço claro
+            r = int(r0 + (255 - r0) * f)
+            g = int(g0 + (255 - g0) * f)
+            b = int(b0 + (255 - b0) * f)
+            saida += bytes((b, g, r, int(255 * dentro / (ss * ss))))
+    return bytes(saida)
+
+
+class Bandeja:
+    """Ícone na bandeja do sistema. Clique esquerdo = abrir; clique direito = Abrir / Sair.
+    Se algo falhar ao criar, 'ok' fica False e o app continua como antes."""
+    MSG = 0x8001                  # WM_APP + 1: mensagem que o Windows manda ao clicar no ícone
+
+    def __init__(self, ao_abrir, ao_sair, dica, cor_hex, caminho_ico=None):
+        self.ok = False
+        self._ao_abrir, self._ao_sair = ao_abrir, ao_sair
+        self._hwnd = self._hicon = self._nid = None
+        self._user = self._shell = self._gdi = None
+        self._msg_barra_criada = 0
+        try:
+            self._iniciar(dica, cor_hex, caminho_ico)
+            self.ok = True
+        except Exception:
+            self.remover()
+
+    def _iniciar(self, dica, cor_hex, caminho_ico):
+        user = self._user = ctypes.WinDLL("user32", use_last_error=True)
+        shell = self._shell = ctypes.WinDLL("shell32", use_last_error=True)
+        gdi = self._gdi = ctypes.WinDLL("gdi32", use_last_error=True)
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        vp, ui, i32, wp = ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int, ctypes.c_wchar_p
+
+        k32.GetModuleHandleW.argtypes, k32.GetModuleHandleW.restype = [wp], vp
+        user.RegisterClassW.argtypes = [ctypes.POINTER(_WNDCLASS)]
+        user.RegisterClassW.restype = ctypes.c_uint16
+        user.CreateWindowExW.argtypes = [ui, wp, wp, ui, i32, i32, i32, i32, vp, vp, vp, vp]
+        user.CreateWindowExW.restype = vp
+        user.DefWindowProcW.argtypes = [vp, ui, ctypes.c_size_t, ctypes.c_ssize_t]
+        user.DefWindowProcW.restype = ctypes.c_ssize_t
+        user.DestroyWindow.argtypes = [vp]
+        user.RegisterWindowMessageW.argtypes, user.RegisterWindowMessageW.restype = [wp], ui
+        user.CreatePopupMenu.restype = vp
+        user.AppendMenuW.argtypes = [vp, ui, ctypes.c_size_t, wp]
+        user.TrackPopupMenu.argtypes = [vp, ui, i32, i32, i32, vp, vp]
+        user.DestroyMenu.argtypes = [vp]
+        user.GetCursorPos.argtypes = [ctypes.POINTER(_POINT)]
+        user.SetForegroundWindow.argtypes = [vp]
+        user.PostMessageW.argtypes = [vp, ui, ctypes.c_size_t, ctypes.c_ssize_t]
+        user.GetSystemMetrics.argtypes = [i32]
+        user.LoadImageW.argtypes = [vp, wp, ui, i32, i32, ui]
+        user.LoadImageW.restype = vp
+        user.CreateIconIndirect.argtypes = [ctypes.POINTER(_ICONINFO)]
+        user.CreateIconIndirect.restype = vp
+        user.DestroyIcon.argtypes = [vp]
+        gdi.CreateBitmap.argtypes = [i32, i32, ui, ui, vp]
+        gdi.CreateBitmap.restype = vp
+        gdi.DeleteObject.argtypes = [vp]
+        shell.Shell_NotifyIconW.argtypes = [ui, ctypes.POINTER(_NOTIFYICONDATA)]
+
+        # janela oculta que recebe as mensagens do ícone (fica referenciada para não ser
+        # coletada: o Windows chama esta função enquanto o app roda)
+        proc_tipo = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, vp, ui, ctypes.c_size_t,
+                                       ctypes.c_ssize_t)
+        self._proc = proc_tipo(self._wndproc)
+        hinst = k32.GetModuleHandleW(None)
+        classe = _WNDCLASS()
+        classe.lpfnWndProc = ctypes.cast(self._proc, vp).value
+        classe.hInstance = hinst
+        classe.lpszClassName = "FrasesProntasBandeja"
+        user.RegisterClassW(ctypes.byref(classe))        # se já existir, o Create abaixo usa a existente
+        self._hwnd = user.CreateWindowExW(0, "FrasesProntasBandeja", "Frases Prontas",
+                                          0x80000000, 0, 0, 0, 0, None, None, hinst, None)
+        if not self._hwnd:
+            raise OSError("janela da bandeja não criada")
+        self._msg_barra_criada = user.RegisterWindowMessageW("TaskbarCreated")
+
+        self._hicon = self._carregar_icone(caminho_ico, cor_hex)
+        if not self._hicon:
+            raise OSError("ícone da bandeja não criado")
+
+        nid = self._nid = _NOTIFYICONDATA()
+        nid.cbSize = ctypes.sizeof(_NOTIFYICONDATA)
+        nid.hWnd = self._hwnd
+        nid.uID = 1
+        nid.uFlags = 0x1 | 0x2 | 0x4                     # NIF_MESSAGE | NIF_ICON | NIF_TIP
+        nid.uCallbackMessage = self.MSG
+        nid.hIcon = self._hicon
+        nid.szTip = dica[:127]
+        self._adicionar()
+
+    def _adicionar(self):
+        if not self._shell.Shell_NotifyIconW(0, ctypes.byref(self._nid)):    # NIM_ADD
+            raise OSError("Shell_NotifyIcon falhou")
+
+    def _carregar_icone(self, caminho_ico, cor_hex):
+        user, gdi = self._user, self._gdi
+        tam = user.GetSystemMetrics(49) or 16            # SM_CXSMICON (16 em 100% de escala)
+        if caminho_ico and os.path.exists(caminho_ico):
+            # IMAGE_ICON, LR_LOADFROMFILE
+            h = user.LoadImageW(None, caminho_ico, 1, tam, tam, 0x10)
+            if h:
+                return h
+        dados = pixels_icone_bandeja(tam, cor_hex)
+        cor = (ctypes.c_ubyte * len(dados)).from_buffer_copy(dados)
+        linha_mascara = ((tam + 15) // 16) * 2
+        mascara_dados = (ctypes.c_ubyte * (linha_mascara * tam))()
+        bmp_cor = gdi.CreateBitmap(tam, tam, 1, 32, ctypes.cast(cor, ctypes.c_void_p))
+        bmp_mascara = gdi.CreateBitmap(tam, tam, 1, 1, ctypes.cast(mascara_dados, ctypes.c_void_p))
+        try:
+            info = _ICONINFO(1, 0, 0, bmp_mascara, bmp_cor)
+            return user.CreateIconIndirect(ctypes.byref(info))
+        finally:
+            if bmp_cor:
+                gdi.DeleteObject(bmp_cor)
+            if bmp_mascara:
+                gdi.DeleteObject(bmp_mascara)
+
+    def _wndproc(self, hwnd, msg, wparam, lparam):
+        try:
+            if msg == self.MSG:
+                evento = lparam & 0xFFFF
+                if evento in (0x0202, 0x0203):           # soltou / duplo clique esquerdo
+                    self._ao_abrir()
+                elif evento in (0x0205, 0x007B):         # soltou clique direito / tecla de menu
+                    self._menu()
+                return 0
+            if self._msg_barra_criada and msg == self._msg_barra_criada:
+                self._adicionar()                        # o Explorer reiniciou: recoloca o ícone
+                return 0
+        except Exception:
+            pass
+        return self._user.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    def _menu(self):
+        user = self._user
+        ponto = _POINT()
+        user.GetCursorPos(ctypes.byref(ponto))
+        menu = user.CreatePopupMenu()
+        if not menu:
+            return
+        try:
+            user.AppendMenuW(menu, 0, 1, "Abrir")
+            user.AppendMenuW(menu, 0x800, 0, None)       # separador
+            user.AppendMenuW(menu, 0, 2, "Sair")
+            user.SetForegroundWindow(self._hwnd)         # sem isso o menu não fecha ao clicar fora
+            # TPM_RIGHTBUTTON | TPM_RETURNCMD: devolve o item escolhido (0 = nenhum)
+            escolha = user.TrackPopupMenu(menu, 0x0002 | 0x0100, ponto.x, ponto.y, 0,
+                                          self._hwnd, None)
+            user.PostMessageW(self._hwnd, 0, 0, 0)       # WM_NULL (exigido pelo Windows)
+        finally:
+            user.DestroyMenu(menu)
+        if escolha == 1:
+            self._ao_abrir()
+        elif escolha == 2:
+            self._ao_sair()
+
+    def remover(self):
+        """Tira o ícone da bandeja e libera tudo. Pode ser chamada mais de uma vez."""
+        try:
+            if self._nid is not None and self._shell is not None:
+                self._shell.Shell_NotifyIconW(2, ctypes.byref(self._nid))    # NIM_DELETE
+        except Exception:
+            pass
+        self._nid = None
+        try:
+            if self._hwnd and self._user is not None:
+                self._user.DestroyWindow(self._hwnd)
+        except Exception:
+            pass
+        self._hwnd = None
+        try:
+            if self._hicon and self._user is not None:
+                self._user.DestroyIcon(self._hicon)
+        except Exception:
+            pass
+        self._hicon = None
 
 
 # ---------- widgets auxiliares ----------
@@ -1360,7 +1629,8 @@ class ConfirmarDialogo(tk.Toplevel):
               fonte, False, 14, 7).pack(side="right", padx=8)
 
         self.bind("<Escape>", lambda e: self.destroy())
-        self.bind("<Return>", lambda e: self.ok())
+        self.bind("<Return>", lambda e: self.destroy())     # Enter = Cancelar (o seguro)
+        self.focus_set()
         self.deiconify()
         try:
             self.wait_visibility()
@@ -2078,7 +2348,7 @@ class DialogoConfiguracoes(tk.Toplevel):
         sub_copia = tk.Frame(moldura_copia, bg=c["card"])
         sub_copia.pack(fill="x", padx=12, pady=10)
 
-        tk.Label(sub_copia, text="Intervalo entre cópias (1.5s)", bg=c["card"], fg=c["texto"],
+        tk.Label(sub_copia, text=f"Intervalo entre cópias ({INTERVALO_COPIA:g}s)", bg=c["card"], fg=c["texto"],
                  font=(fonte, 10)).pack(side="left")
 
         usando = self.master.cfg.get("usar_intervalo", True)
@@ -2217,6 +2487,410 @@ class DialogoConfiguracoes(tk.Toplevel):
         )
 
 
+def registrar_erro(exc_tipo, valor, tb):
+    """Grava erros não tratados em CONFIG_DIR/erro.log. No Windows o app roda com
+    pythonw.exe (sem console), então sem isto qualquer erro passaria em silêncio."""
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        caminho = os.path.join(CONFIG_DIR, "erro.log")
+        try:
+            if os.path.getsize(caminho) > 200_000:
+                os.replace(caminho, caminho + ".antigo")
+        except OSError:
+            pass
+        with open(caminho, "a", encoding="utf-8") as f:
+            f.write("--- %s ---\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+            f.write("".join(traceback.format_exception(exc_tipo, valor, tb)))
+            f.write("\n")
+    except Exception:
+        pass
+    if sys.stderr is not None:
+        try:
+            traceback.print_exception(exc_tipo, valor, tb)
+        except Exception:
+            pass
+
+
+# ---------- ícone na bandeja do sistema (Linux) ----------
+# O Tk não sabe criar ícone de bandeja, e o GTK não pode dividir o laço de eventos com ele.
+# Por isso o ícone roda num PROCESSO AUXILIAR (este mesmo script com --bandeja-linux) que
+# avisa o app por linhas de texto: "ok", "abrir", "sair" ou "falhou: motivo".
+# Ordem de tentativa no auxiliar: XApp (Mint) -> AppIndicator (KDE, Ubuntu, GNOME com
+# extensão) -> Gtk.StatusIcon (bandejas antigas).
+FLAG_BANDEJA_LINUX = "--bandeja-linux"
+
+
+def _png_bytes(tam, rgba):
+    """Codifica um PNG RGBA (sem bibliotecas). 'rgba' = bytes com 4 bytes por pixel."""
+    import struct
+    import zlib
+
+    def bloco(tipo, dados):
+        corpo = tipo + dados
+        return (struct.pack(">I", len(dados)) + corpo
+                + struct.pack(">I", zlib.crc32(corpo) & 0xFFFFFFFF))
+
+    linhas = b"".join(b"\x00" + rgba[y * tam * 4:(y + 1) * tam * 4] for y in range(tam))
+    return (b"\x89PNG\r\n\x1a\n"
+            + bloco(b"IHDR", struct.pack(">IIBBBBB", tam, tam, 8, 6, 0, 0, 0))
+            + bloco(b"IDAT", zlib.compress(linhas, 9))
+            + bloco(b"IEND", b""))
+
+
+def gerar_png_bandeja(cor_hex, tam=64):
+    """Cria (se ainda não existir) o PNG do ícone na cor do app e devolve o caminho."""
+    cor = (hex_valido(cor_hex) or "#4f6df5").lstrip("#").lower()
+    caminho = os.path.join(CONFIG_DIR, "bandeja-%s.png" % cor)
+    if os.path.exists(caminho):
+        return caminho
+    bgra = pixels_icone_bandeja(tam, cor_hex)
+    rgba = bytearray(len(bgra))
+    rgba[0::4], rgba[1::4], rgba[2::4], rgba[3::4] = bgra[2::4], bgra[1::4], bgra[0::4], bgra[3::4]
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = caminho + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(_png_bytes(tam, bytes(rgba)))
+    os.replace(tmp, caminho)
+    return caminho
+
+
+def rodar_bandeja_linux(caminho_png, dica):
+    """PROCESSO AUXILIAR: cria o ícone de bandeja e conversa com o app pela saída padrão."""
+    def dizer(msg):
+        try:
+            sys.stdout.write(msg + "\n")
+            sys.stdout.flush()
+        except Exception:
+            os._exit(0)                      # o app fechou
+
+    try:
+        import gi
+        gi.require_version("Gtk", "3.0")
+        from gi.repository import Gtk, GLib
+        r = Gtk.init_check()
+        if (r[0] if isinstance(r, tuple) else r) is False:
+            raise RuntimeError("sem tela")
+    except Exception as e:
+        dizer("falhou: GTK indisponível (%s)" % e)
+        return
+
+    menu = Gtk.Menu()
+    item_abrir = Gtk.MenuItem(label="Abrir")
+    item_abrir.connect("activate", lambda *_: dizer("abrir"))
+    item_sair = Gtk.MenuItem(label="Sair")
+    item_sair.connect("activate", lambda *_: dizer("sair"))
+    menu.append(item_abrir)
+    menu.append(Gtk.SeparatorMenuItem())
+    menu.append(item_sair)
+    menu.show_all()
+    manter = []                              # evita o coletor de lixo apagar o ícone
+
+    def host_sni():
+        """Existe alguém mostrando ícones do tipo StatusNotifier (KDE, Cinnamon, GNOME+ext.)?"""
+        try:
+            from gi.repository import Gio
+            con = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            for nome in ("org.kde.StatusNotifierWatcher", "org.freedesktop.StatusNotifierWatcher"):
+                try:
+                    r = con.call_sync(
+                        nome, "/StatusNotifierWatcher", "org.freedesktop.DBus.Properties", "Get",
+                        GLib.Variant("(ss)", (nome, "IsStatusNotifierHostRegistered")),
+                        GLib.VariantType("(v)"), Gio.DBusCallFlags.NONE, 1000, None)
+                    if r.unpack()[0]:
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return False
+
+    def usar_xapp():
+        gi.require_version("XApp", "1.0")
+        from gi.repository import XApp
+        ic = XApp.StatusIcon()
+        ic.set_name("frases-prontas")
+        ic.set_icon_name(caminho_png)
+        ic.set_tooltip_text(dica)
+        ic.set_secondary_menu(menu)                      # botão direito
+        ic.connect("activate", lambda _ic, *a: dizer("abrir") if (not a or a[0] in (1, 2)) else None)
+        ic.set_visible(True)
+        manter.append(ic)
+
+        def verificar():
+            try:
+                return ic.get_state() != XApp.StatusIconState.NO_SUPPORT
+            except Exception:
+                return True
+
+        return verificar, lambda: ic.set_visible(False)
+
+    def usar_appindicator():
+        mod = None
+        for nome in ("AyatanaAppIndicator3", "AppIndicator3"):
+            try:
+                gi.require_version(nome, "0.1")
+                mod = __import__("gi.repository", fromlist=[nome])
+                mod = getattr(mod, nome)
+                break
+            except Exception:
+                continue
+        if mod is None or not host_sni():
+            raise RuntimeError("sem AppIndicator ou sem bandeja")
+        pasta, arq = os.path.split(caminho_png)
+        ind = mod.Indicator.new_with_path("frases-prontas", os.path.splitext(arq)[0],
+                                          mod.IndicatorCategory.APPLICATION_STATUS, pasta)
+        ind.set_status(mod.IndicatorStatus.ACTIVE)
+        ind.set_title(dica)
+        ind.set_menu(menu)                               # clique mostra o menu (Abrir / Sair)
+        ind.set_secondary_activate_target(item_abrir)    # clique do meio = Abrir
+        manter.append(ind)
+        return (lambda: True), lambda: ind.set_status(mod.IndicatorStatus.PASSIVE)
+
+    def usar_statusicon():
+        ic = Gtk.StatusIcon.new_from_file(caminho_png)
+        ic.set_tooltip_text(dica)
+        ic.connect("activate", lambda *_: dizer("abrir"))
+        ic.connect("popup-menu", lambda i, botao, tempo: menu.popup(
+            None, None, Gtk.StatusIcon.position_menu, i, botao, tempo))
+        ic.set_visible(True)
+        manter.append(ic)
+        return ic.is_embedded, lambda: ic.set_visible(False)
+
+    estrategias = [usar_xapp, usar_appindicator, usar_statusicon]
+
+    def tentar(i):
+        if i >= len(estrategias):
+            dizer("falhou: nenhuma bandeja disponível")
+            Gtk.main_quit()
+            return False
+        try:
+            verificar, esconder = estrategias[i]()
+        except Exception:
+            return tentar(i + 1)
+
+        def conferir():
+            try:
+                bom = bool(verificar())
+            except Exception:
+                bom = False
+            if bom:
+                dizer("ok")
+            else:
+                try:
+                    esconder()
+                except Exception:
+                    pass
+                tentar(i + 1)
+            return False
+        GLib.timeout_add(800, conferir)
+        return False
+
+    def vigiar_pai():
+        """Quando o app fecha (ou morre), a entrada padrão acaba e o ícone sai junto."""
+        try:
+            while sys.stdin.readline():
+                pass
+        except Exception:
+            pass
+        GLib.idle_add(Gtk.main_quit)
+
+    threading.Thread(target=vigiar_pai, daemon=True).start()
+    GLib.idle_add(tentar, 0)
+    Gtk.main()
+
+
+class BandejaLinux:
+    """Lado do app: abre o processo auxiliar e repassa os cliques. Chame processar() de
+    tempos em tempos (na thread do Tk). 'ok' só vira True quando o auxiliar confirma que o
+    ícone realmente apareceu; se nada funcionar, 'desistiu' vira True."""
+    TEMPO_MAX = 6.0
+
+    def __init__(self, ao_abrir, ao_sair, ao_pronta, ao_perdida, dica, cor_hex, caminho_png=None):
+        self.ok = False
+        self.desistiu = False
+        self._cb = (ao_abrir, ao_sair, ao_pronta, ao_perdida)
+        self._dica = dica
+        self._fila = queue.Queue()
+        self._proc = None
+        self._motivos = []
+        try:
+            if caminho_png and os.path.exists(caminho_png):
+                self._png = caminho_png
+            else:
+                self._png = gerar_png_bandeja(cor_hex)
+        except Exception as e:
+            self._png = None
+            self._motivos.append("ícone: %s" % e)
+        cand = [sys.executable, "/usr/bin/python3"]
+        self._candidatos = [c for i, c in enumerate(cand) if c and c not in cand[:i] and os.path.exists(c)]
+        self._inicio = time.monotonic()
+        if self._png is None or not self._abrir_proximo():
+            self.desistiu = True
+
+    def _abrir_proximo(self):
+        while self._candidatos:
+            exe = self._candidatos.pop(0)
+            cmd = [exe]
+            if not getattr(sys, "frozen", False):
+                cmd.append(os.path.abspath(__file__))
+            cmd += [FLAG_BANDEJA_LINUX, self._png, self._dica]
+            try:
+                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL, text=True, bufsize=1)
+            except OSError as e:
+                self._motivos.append("%s: %s" % (exe, e))
+                continue
+            self._proc = proc
+            self._inicio = time.monotonic()
+            threading.Thread(target=self._ler, args=(proc,), daemon=True).start()
+            return True
+        return False
+
+    def _ler(self, proc):
+        try:
+            for linha in proc.stdout:
+                self._fila.put((proc, linha.strip()))
+        except Exception:
+            pass
+        self._fila.put((proc, None))
+
+    def _falha(self, motivo):
+        self._motivos.append(motivo)
+        self._matar()
+        if not self._abrir_proximo():
+            self.desistiu = True
+
+    def processar(self):
+        """Trata o que o auxiliar mandou. Roda na thread do Tk."""
+        while True:
+            try:
+                proc, linha = self._fila.get_nowait()
+            except queue.Empty:
+                break
+            if proc is not self._proc:
+                continue                                  # sobra de um auxiliar já descartado
+            if linha is None:                             # o auxiliar terminou
+                if self.ok:
+                    self.ok = False
+                    self.desistiu = True
+                    self._cb[3]()
+                elif not self.desistiu:
+                    self._falha("o auxiliar terminou sem confirmar")
+            elif linha == "ok":
+                if not self.ok:
+                    self.ok = True
+                    self._cb[2]()
+            elif linha.startswith("falhou"):
+                if not self.ok:
+                    self._falha(linha)
+            elif linha == "abrir":
+                self._cb[0]()
+            elif linha == "sair":
+                self._cb[1]()
+        if (not self.ok and not self.desistiu and self._proc is not None
+                and time.monotonic() - self._inicio > self.TEMPO_MAX):
+            self._falha("tempo esgotado")
+        if DEBUG and self.desistiu and self._motivos:
+            print("bandeja:", "; ".join(self._motivos), file=sys.stderr)
+
+    def _matar(self):
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+    def remover(self):
+        self.ok = False
+        self._matar()
+
+
+class _XClientMessage(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("serial", ctypes.c_ulong), ("send_event", ctypes.c_int),
+                ("display", ctypes.c_void_p), ("window", ctypes.c_ulong),
+                ("message_type", ctypes.c_ulong), ("format", ctypes.c_int),
+                ("data", ctypes.c_long * 5)]
+
+
+class _XEvent(ctypes.Union):
+    _fields_ = [("xclient", _XClientMessage), ("pad", ctypes.c_long * 24)]
+
+
+def x11_barra_de_tarefas(janela, mostrar, antes_de_mostrar=False):
+    """Linux/X11: pede ao gerenciador de janelas para esconder (mostrar=False) ou mostrar a
+    janela na barra de tarefas e no alternador de janelas. Devolve True se o pedido foi
+    enviado. Sem X11 (ex.: Wayland puro) não faz nada e devolve False.
+    antes_de_mostrar=True: com a janela ainda escondida, grava a marca direto na propriedade da
+    janela, para ela já nascer sem botão (a mensagem só vale depois de a janela aparecer e,
+    sozinha, deixa o botão visível por um instante)."""
+    try:
+        nome = ctypes.util.find_library("X11") or "libX11.so.6"
+        x = ctypes.CDLL(nome)
+        vp, ul, i32 = ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int
+        x.XOpenDisplay.argtypes, x.XOpenDisplay.restype = [ctypes.c_char_p], vp
+        x.XInternAtom.argtypes, x.XInternAtom.restype = [vp, ctypes.c_char_p, i32], ul
+        x.XDefaultRootWindow.argtypes, x.XDefaultRootWindow.restype = [vp], ul
+        x.XQueryTree.argtypes = [vp, ul, ctypes.POINTER(ul), ctypes.POINTER(ul),
+                                 ctypes.POINTER(ctypes.POINTER(ul)), ctypes.POINTER(ctypes.c_uint)]
+        x.XQueryTree.restype = i32
+        x.XFree.argtypes = [vp]
+        x.XSendEvent.argtypes = [vp, ul, i32, ctypes.c_long, ctypes.POINTER(_XEvent)]
+        x.XSendEvent.restype = i32
+        x.XSync.argtypes = [vp, i32]
+        x.XChangeProperty.argtypes = [vp, ul, ul, ul, i32, i32, vp, i32]
+        x.XCloseDisplay.argtypes = [vp]
+    except (OSError, AttributeError):
+        return False
+    dpy = x.XOpenDisplay(None)
+    if not dpy:
+        return False
+    try:
+        root = x.XDefaultRootWindow(dpy)
+        # o Tk coloca cada janela dentro de uma "wrapper": é ela que o gerenciador enxerga
+        r, pai, filhos, n = ul(), ul(), ctypes.POINTER(ul)(), ctypes.c_uint()
+        alvo = ul(janela.winfo_id())
+        if x.XQueryTree(dpy, alvo, ctypes.byref(r), ctypes.byref(pai),
+                        ctypes.byref(filhos), ctypes.byref(n)):
+            if filhos:
+                x.XFree(ctypes.cast(filhos, vp))
+            if pai.value and pai.value != root:
+                alvo = pai
+        if antes_de_mostrar:
+            atomos = (ctypes.c_long * 2)(x.XInternAtom(dpy, b"_NET_WM_STATE_SKIP_TASKBAR", 0),
+                                         x.XInternAtom(dpy, b"_NET_WM_STATE_SKIP_PAGER", 0))
+            # tipo ATOM (4), formato 32, PropModeAppend (2): soma ao que o Tk já tiver gravado
+            x.XChangeProperty(dpy, alvo.value, x.XInternAtom(dpy, b"_NET_WM_STATE", 0), 4, 32, 2,
+                              ctypes.cast(atomos, vp), 2)
+            x.XSync(dpy, 0)
+            return True
+        ev = _XEvent()
+        ev.xclient.type = 33                                   # ClientMessage
+        ev.xclient.send_event = 1
+        ev.xclient.display = dpy
+        ev.xclient.window = alvo.value
+        ev.xclient.message_type = x.XInternAtom(dpy, b"_NET_WM_STATE", 0)
+        ev.xclient.format = 32
+        ev.xclient.data[0] = 0 if mostrar else 1               # _NET_WM_STATE_REMOVE / ADD
+        ev.xclient.data[1] = x.XInternAtom(dpy, b"_NET_WM_STATE_SKIP_TASKBAR", 0)
+        ev.xclient.data[2] = x.XInternAtom(dpy, b"_NET_WM_STATE_SKIP_PAGER", 0)
+        ev.xclient.data[3] = 1                                 # pedido de um aplicativo comum
+        # SubstructureNotify | SubstructureRedirect na janela raiz
+        ok = x.XSendEvent(dpy, root, 0, (1 << 19) | (1 << 20), ctypes.byref(ev))
+        x.XSync(dpy, 0)
+        return bool(ok)
+    except Exception:
+        return False
+    finally:
+        x.XCloseDisplay(dpy)
+
+
+
 class App(tk.Tk):
     def __init__(self, iniciar_recolhido=False):
         super().__init__()
@@ -2236,6 +2910,9 @@ class App(tk.Tk):
         if self.tema not in TEMAS:
             self.tema = "claro"
         self.fixado = bool(self.cfg.get("fixado", False))
+        self.bandeja = None
+        if BANDEJA_SUPORTADA:
+            self._iniciar_bandeja()
         if iniciar_recolhido and not self.fixado:
             self.withdraw()          # aberto pelo login: a janela nem chega a aparecer
         self.categoria = "Todas"
@@ -2302,13 +2979,19 @@ class App(tk.Tk):
         self.bind("<FocusOut>", self._ao_perder_foco)
         self.after(INTERVALO_VIGIA, self._vigiar_foco)
 
-        # Iniciar com o computador: ligado por padrão na primeira execução; nas seguintes,
-        # só atualiza o caminho (caso o app tenha sido movido) se o registro ainda existir
+        # Iniciar com o computador: ATIVADO POR PADRÃO. Só fica desligado se a pessoa
+        # desativar pelo botão das configurações (isso grava False em config.json).
         if AUTOSTART_SUPORTADO:
-            if "iniciar_com_sistema" not in self.cfg:
-                self.cfg["iniciar_com_sistema"] = definir_autostart(True)
-                self.gravar(ARQUIVO_CFG, self.cfg, avisar=False)
-            elif self.cfg["iniciar_com_sistema"] and autostart_ativo():
+            pref = self.cfg.get("iniciar_com_sistema")
+            if pref is None:
+                # primeira execução (ou preferência nunca definida): liga por padrão.
+                # Se o registro falhar, nada é gravado, então tenta de novo na próxima abertura.
+                if definir_autostart(True):
+                    self.cfg["iniciar_com_sistema"] = True
+                    self.gravar(ARQUIVO_CFG, self.cfg, avisar=False)
+            elif pref:
+                # preferência ligada: garante o registro (recria se sumiu) e atualiza o
+                # caminho caso o app tenha sido movido
                 definir_autostart(True)
 
         # Aberto pelo login: já começa como barra lateral (a menos que esteja fixado)
@@ -2325,6 +3008,10 @@ class App(tk.Tk):
                     self.aba = None
                 self.deiconify()
 
+    def report_callback_exception(self, exc, val, tb):
+        """Erros dentro de callbacks do Tk (cliques, timers) vão para o erro.log."""
+        registrar_erro(exc, val, tb)
+
     def _carregar_dados(self):
         """Lê frases e configurações. O que estiver fora do formato (arquivo editado à mão,
         versão antiga, etc.) é ignorado em vez de impedir o app de abrir; antes, guarda uma
@@ -2334,6 +3021,8 @@ class App(tk.Tk):
         bruto = _ler(ARQUIVO, None)
         if bruto is None:                          # primeira execução: frases iniciais
             frases = copy.deepcopy(EXEMPLOS)
+            if ARQUIVO in _CORROMPIDOS:            # não é a primeira vez: o arquivo estava quebrado
+                problemas.append("frases")
         else:
             frases, descartados = sanear_frases(bruto)
             if descartados is None:                # não era uma lista
@@ -2344,6 +3033,8 @@ class App(tk.Tk):
 
         bruto_cfg = _ler(ARQUIVO_CFG, {})
         cfg, ruim = sanear_cfg(bruto_cfg)
+        if not bruto_cfg and ARQUIVO_CFG in _CORROMPIDOS:
+            ruim = True
         if ruim:
             guardar_copia_invalida(ARQUIVO_CFG)
             problemas.append("configurações")
@@ -2368,6 +3059,108 @@ class App(tk.Tk):
                     self.iconphoto(True, self._img_icone)
         except tk.TclError:
             pass
+
+    # ---------- ícone na bandeja do sistema ----------
+    def _iniciar_bandeja(self):
+        """Ícone perto do relógio. Com ele, o botão do app na barra de tarefas some: o app
+        fica só na bandeja. Se a bandeja não puder ser criada, o botão continua aparecendo,
+        para o app nunca ficar sem um jeito de abrir."""
+        cor = hex_valido(self.cfg.get("cor_personalizada") or "") or TEMAS[self.tema]["acento"]
+        base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+        if LINUX:
+            self._iniciar_bandeja_linux(cor, base)
+            return
+        bandeja = Bandeja(lambda: self.after(0, self._bandeja_abrir),
+                          lambda: self.after(0, self._bandeja_sair),
+                          "Frases Prontas", cor, os.path.join(base, "icone.ico"))
+        if not bandeja.ok:
+            return
+        self.bandeja = bandeja
+        self.protocol("WM_DELETE_WINDOW", self.destroy)    # o X também tira o ícone da bandeja
+        atexit.register(bandeja.remover)                   # e qualquer outra saída
+        try:
+            self.attributes("-toolwindow", True)      # janela de ferramenta: sem botão na barra
+        except tk.TclError:
+            pass
+
+    # --- Linux: o ícone vive num processo auxiliar; aqui só se acompanha o que ele diz ---
+    def _iniciar_bandeja_linux(self, cor, base):
+        self._sem_barra_linux = False
+        self.bandeja = BandejaLinux(
+            self._bandeja_abrir, self._bandeja_sair,
+            self._bandeja_linux_pronta, self._bandeja_linux_perdida,
+            "Frases Prontas", cor, os.path.join(base, "icone.png"))
+        atexit.register(self.bandeja.remover)
+        self._bandeja_linux_poll()
+
+    def _bandeja_linux_poll(self):
+        b = self.bandeja
+        if b is None or b.desistiu:
+            return                          # sem bandeja: o app segue na barra de tarefas
+        try:
+            b.processar()
+            self.after(150, self._bandeja_linux_poll)
+        except tk.TclError:
+            pass
+
+    def _bandeja_linux_pronta(self):
+        """O ícone apareceu de verdade: agora é seguro tirar o app da barra de tarefas."""
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self._sem_barra_linux = True
+        self.bind("<Map>", self._bandeja_linux_ao_mapear, add="+")
+        self._bandeja_linux_aplicar()
+
+    def deiconify(self):
+        # toda vez que a janela vai aparecer, já a marca como "sem botão na barra" antes
+        if LINUX and getattr(self, "_sem_barra_linux", False):
+            try:
+                x11_barra_de_tarefas(self, mostrar=False, antes_de_mostrar=True)
+            except Exception:
+                pass
+        super().deiconify()
+
+    def _bandeja_linux_ao_mapear(self, ev):
+        if ev.widget is self:               # reforço logo após aparecer (sem espera)
+            self._bandeja_linux_aplicar()
+
+    def _bandeja_linux_aplicar(self):
+        if self._sem_barra_linux and self.winfo_ismapped():
+            x11_barra_de_tarefas(self, mostrar=False)
+
+    def _bandeja_linux_perdida(self):
+        """O auxiliar morreu: devolve o botão da barra de tarefas para não perder o app."""
+        self._sem_barra_linux = False
+        self.bandeja = None
+        try:
+            if self.winfo_ismapped():
+                x11_barra_de_tarefas(self, mostrar=True)
+            elif not self.recolhido:
+                self.deiconify()
+        except tk.TclError:
+            pass
+
+    def _bandeja_abrir(self):
+        """Clique no ícone da bandeja: mostra o app (expande a barra lateral se preciso)."""
+        try:
+            if self.recolhido:
+                self.expandir()
+            else:
+                self.deiconify()
+                self._trazer_para_frente()
+        except tk.TclError:
+            pass
+
+    def _bandeja_sair(self):
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+
+    def destroy(self):
+        bandeja, self.bandeja = getattr(self, "bandeja", None), None
+        if bandeja is not None:
+            bandeja.remover()                          # tira o ícone da bandeja ao fechar
+        super().destroy()
 
     def _ver_pedido(self):
         """Outra instância foi aberta (ex.: atalho clicado de novo): em vez de duplicar,
@@ -2486,7 +3279,7 @@ class App(tk.Tk):
             # Sem foco, mas o mouse está sobre a janela (ex.: arrastando pela
             # barra de título): espera e confere de novo
             if self._ponteiro_na_janela():
-                self._dbg("checar_foco: mouse sobre a janela, tenta de novo em 500 ms")
+                self._dbg("checar_foco: mouse sobre a janela, tenta de novo em 150 ms")
                 self._foco_id = self.after(150, self._checar_foco)
                 return
             self._dbg("checar_foco: recolhendo")
@@ -2495,11 +3288,15 @@ class App(tk.Tk):
             pass
 
     def _vigiar_foco(self):
-        """Confere o foco a cada 200 ms. O evento FocusOut pode atrasar ou nem chegar
+        """Confere o foco a cada INTERVALO_VIGIA ms. O evento FocusOut pode atrasar ou nem chegar
         (clicar na barra de tarefas, painéis, apps Wayland...), então isto garante que
         a barra lateral aparece logo depois que o app perde o foco."""
+        # recolhido ou fixado: não há o que vigiar, então checa só a cada 500 ms;
+        # aberto (ou com o menu de três pontos aberto): mantém o ritmo rápido
+        ocioso = (self.recolhido or self.fixado) and self.menu_aberto is None
         try:
-            self.after(INTERVALO_VIGIA, self._vigiar_foco)
+            self.after(INTERVALO_VIGIA_OCIOSO if ocioso else INTERVALO_VIGIA,
+                       self._vigiar_foco)
         except tk.TclError:
             return
         if self.menu_aberto is not None and time.monotonic() - self._menu_t > 0.4:
@@ -2756,16 +3553,19 @@ class App(tk.Tk):
     def posicionar(self):
         """Janela pequena encaixada no canto da tela."""
         self.update_idletasks()
-        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        th = _MON.get("thread")
+        if th is not None and th.is_alive():
+            th.join(0.5)                 # dá um instante para a lista de monitores chegar
+        mx, my, sw, sh = listar_monitores(self)[0]       # monitor principal
         larg, alt = min(LARGURA, sw - 2 * MARGEM), min(ALTURA, sh - 2 * MARGEM)
-        x = MARGEM if "esquerdo" in CANTO else sw - larg - MARGEM
+        x = mx + (MARGEM if "esquerdo" in CANTO else sw - larg - MARGEM)
         if "meio" in CANTO:
-            y = (sh - alt) // 2
+            y = my + (sh - alt) // 2
         elif "superior" in CANTO:
-            y = MARGEM + 30
+            y = my + MARGEM + 30
         else:
-            y = sh - alt - MARGEM - 40
-        self.geometry(f"{larg}x{alt}+{x}+{max(y, 0)}")
+            y = my + sh - alt - MARGEM - 40
+        self.geometry(f"{larg}x{alt}+{x}+{max(y, my)}")
 
     def construir(self):
         self.menu_aberto = self.menu_card = None
@@ -2862,6 +3662,11 @@ class App(tk.Tk):
         self.largura_texto = max(200, e.width - 120)
 
     def rolar(self, n):
+        try:
+            if str(self.tk.call("grab", "current")):     # há um diálogo aberto
+                return
+        except tk.TclError:
+            pass
         self.fechar_menu()
         try:
             if self.lista.winfo_height() > self.canvas.winfo_height():
@@ -3549,6 +4354,11 @@ def _definir_id_windows():
 
 
 if __name__ == "__main__":
+    if FLAG_BANDEJA_LINUX in sys.argv[1:]:          # processo auxiliar do ícone de bandeja
+        _i = sys.argv.index(FLAG_BANDEJA_LINUX)
+        rodar_bandeja_linux(sys.argv[_i + 1], sys.argv[_i + 2] if len(sys.argv) > _i + 2 else "Frases Prontas")
+        sys.exit(0)
+    sys.excepthook = registrar_erro
     recolhido = FLAG_RECOLHIDO in sys.argv[1:]
     if not obter_instancia_unica():
         if not recolhido:              # aberto à mão: faz a instância existente aparecer
